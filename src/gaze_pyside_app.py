@@ -9,6 +9,8 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import camsettingsh264 as camsettings
+import cv2
+import mediapipe as mp
 
 
 class VideoWorker(QtCore.QObject):
@@ -19,6 +21,15 @@ class VideoWorker(QtCore.QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = False
+        mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
 
     @QtCore.Slot()
     def start(self):
@@ -57,6 +68,21 @@ class VideoWorker(QtCore.QObject):
                         break
 
                     img = frame.to_ndarray(format="bgr24")
+
+                    try:
+                        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        results = self.face_mesh.process(rgb)
+
+                        if results.multi_face_landmarks:
+                            h, w, _ = img.shape
+                            for face_landmarks in results.multi_face_landmarks:
+                                for lm in face_landmarks.landmark:
+                                    x = int(lm.x * w)
+                                    y = int(lm.y * h)
+                                    cv2.circle(img, (x, y), 1, (0, 255, 0), -1)
+                    except Exception as e:
+                        self.error.emit(f"Mediapipe error: {e}")
+
                     self.frameReady.emit(img)
 
             except av.AVError as e:
