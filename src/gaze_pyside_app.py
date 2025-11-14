@@ -2,18 +2,33 @@
 
 import sys
 import time
+import math
 
 import av  # pip install av
 import numpy as np
+import cv2
+import mediapipe as mp
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import camsettingsh264 as camsettings
-import cv2
-import mediapipe as mp
+
+
+# Mediapipe face / eye landmark indices (canonical face mesh + iris)
+LEFT_IRIS = [474, 475, 476, 477]
+RIGHT_IRIS = [469, 470, 471, 472]
+LEFT_EYE_CORNERS = [33, 133]
+RIGHT_EYE_CORNERS = [362, 263]
+LEFT_EYE_LIDS = [159, 145]
+RIGHT_EYE_LIDS = [386, 374]
+NOSE_TIP = 1
 
 
 class VideoWorker(QtCore.QObject):
+    """Background worker: decodes H.264, applies pre-filter, runs Mediapipe,
+    draws debug overlays, and emits annotated frames as NumPy arrays (BGR).
+    """
+
     frameReady = QtCore.Signal(np.ndarray)
     error = QtCore.Signal(str)
     finished = QtCore.Signal()
@@ -21,6 +36,15 @@ class VideoWorker(QtCore.QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = False
+
+        # Image pre-filter controls (alpha, beta for convertScaleAbs)
+        self._contrast = 1.0  # alpha
+        self._brightness = 0.0  # beta
+
+        # Eye open ratio threshold (height / width) for blink / eye-closed detection
+        self._eye_open_thresh = 0.20
+
+        # Mediapipe face mesh setup
         mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = mp_face_mesh.FaceMesh(
             static_image_mode=False,
@@ -30,6 +54,23 @@ class VideoWorker(QtCore.QObject):
             min_tracking_confidence=0.5,
         )
 
+    # ---- Slots for UI to tweak image pre-filter parameters ----
+
+    @QtCore.Slot(int)
+    def set_brightness(self, value: int):
+        # direct mapping: slider -100..100 -> beta -100..100
+        self._brightness = float(value)
+
+    @QtCore.Slot(int)
+    def set_contrast_slider(self, value: int):
+        # slider 50..200 -> alpha 0.5..2.0
+        self._contrast = float(value) / 100.0
+
+    @QtCore.Slot(float)
+    def set_contrast(self, value: float):
+        self._contrast = float(value)
+
+    # ---- Core loop ----
 
     @QtCore.Slot()
     def start(self):
@@ -69,20 +110,20 @@ class VideoWorker(QtCore.QObject):
 
                     img = frame.to_ndarray(format="bgr24")
 
+                    # Brightness / contrast pre-filter
+                    alpha = self._contrast
+                    beta = self._brightness
+                    if not math.isclose(alpha, 1.0) or not math.isclose(beta, 0.0):
+                        img = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
+
+                    # Run Mediapipe and draw overlays (eyes, gaze vectors)
                     try:
-                        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                        results = self.face_mesh.process(rgb)
-
-                        if results.multi_face_landmarks:
-                            h, w, _ = img.shape
-                            for face_landmarks in results.multi_face_landmarks:
-                                for lm in face_landmarks.landmark:
-                                    x = int(lm.x * w)
-                                    y = int(lm.y * h)
-                                    cv2.circle(img, (x, y), 1, (0, 255, 0), -1)
+                        img = self._process_and_overlay(img)
                     except Exception as e:
-                        self.error.emit(f"Mediapipe error: {e}")
+                        # Don't kill the stream if Mediapipe / drawing hiccups
+                        self.error.emit(f"Processing error: {e}")
 
+                    # Emit the annotated frame
                     self.frameReady.emit(img)
 
             except av.AVError as e:
@@ -106,6 +147,140 @@ class VideoWorker(QtCore.QObject):
 
     def stop(self):
         self._running = False
+
+    # ---- Gaze / blink / overlay helpers ----
+
+    def _process_and_overlay(self, img: np.ndarray) -> np.ndarray:
+        """Run Mediapipe, compute simple per-eye gaze offsets, detect blinks
+        via eye openness ratio, and draw debug overlays.
+        """
+        h, w, _ = img.shape
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(rgb)
+
+        if not results.multi_face_landmarks:
+            return img
+
+        face_landmarks = results.multi_face_landmarks[0]
+
+        def lm(idx: int):
+            p = face_landmarks.landmark[idx]
+            return np.array([p.x, p.y, p.z], dtype=np.float32)
+
+        # Helper to compute eye metrics given index sets
+        def eye_info(iris_idx, corners_idx, lids_idx):
+            iris_pts = np.array([lm(i) for i in iris_idx], dtype=np.float32)
+            iris_center = iris_pts.mean(axis=0)
+
+            c0, c1 = lm(corners_idx[0]), lm(corners_idx[1])
+            eye_center = 0.5 * (c0 + c1)
+
+            # Horizontal eye width in normalized coords
+            width = np.linalg.norm(c0[:2] - c1[:2]) + 1e-6
+
+            lt, lb = lm(lids_idx[0]), lm(lids_idx[1])
+            open_height = abs(lt[1] - lb[1])
+            open_ratio = open_height / width
+
+            # Relative iris position within eye, normalized
+            # 0 = centered; +/- ~1 toward corners/lids
+            horiz = (iris_center[0] - eye_center[0]) / (width / 2.0)
+            vert = (iris_center[1] - eye_center[1]) / ((open_height + 1e-6) / 2.0)
+
+            # Pixel coordinates
+            eye_px = (int(eye_center[0] * w), int(eye_center[1] * h))
+
+            return {
+                "eye_center": eye_center,
+                "iris_center": iris_center,
+                "eye_px": eye_px,
+                "open_ratio": open_ratio,
+                "dir_norm": np.array([horiz, vert], dtype=np.float32),
+            }
+
+        left = eye_info(LEFT_IRIS, LEFT_EYE_CORNERS, LEFT_EYE_LIDS)
+        right = eye_info(RIGHT_IRIS, RIGHT_EYE_CORNERS, RIGHT_EYE_LIDS)
+
+        # Simple blink / eye-closed detection
+        left_open = left["open_ratio"] > self._eye_open_thresh
+        right_open = right["open_ratio"] > self._eye_open_thresh
+
+        # Draw per-eye gaze vectors (in normalized eye space)
+        scale_px = 20
+
+        def draw_eye_vector(info, is_open: bool, color):
+            cx, cy = info["eye_px"]
+            vx, vy = info["dir_norm"]
+
+            if is_open:
+                end_pt = (
+                    int(cx + vx * scale_px),
+                    int(cy + vy * scale_px),
+                )
+                cv2.circle(img, (cx, cy), 2, color, -1)
+                cv2.line(img, (cx, cy), end_pt, color, 2, cv2.LINE_AA)
+
+                label = f"{vx:+.2f},{vy:+.2f} ({info['open_ratio']:.2f})"
+                cv2.putText(
+                    img,
+                    label,
+                    (end_pt[0] + 5, end_pt[1]),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+            else:
+                # Mark closed eye center with small x
+                cv2.putText(
+                    img,
+                    "x",
+                    (cx - 3, cy + 3),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        draw_eye_vector(left, left_open, (0, 255, 0))
+        draw_eye_vector(right, right_open, (0, 200, 255))
+
+        # Combined gaze (average of open eyes) – for now just a debug indicator
+        open_dirs = []
+        centers_px = []
+        for info, is_open in ((left, left_open), (right, right_open)):
+            if is_open:
+                open_dirs.append(info["dir_norm"])
+                centers_px.append(info["eye_px"])
+
+        if open_dirs:
+            avg_dir = np.mean(open_dirs, axis=0)
+            avg_center = np.mean(np.array(centers_px, dtype=np.float32), axis=0)
+            acx, acy = int(avg_center[0]), int(avg_center[1])
+            end_pt = (
+                int(acx + avg_dir[0] * scale_px * 1.2),
+                int(acy + avg_dir[1] * scale_px * 1.2),
+            )
+            cv2.line(img, (acx, acy), end_pt, (255, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(
+                img,
+                f"avg {avg_dir[0]:+.2f},{avg_dir[1]:+.2f}",
+                (end_pt[0] + 5, end_pt[1]),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (255, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+        # Optional: draw a tiny nose marker for reference
+        nose = lm(NOSE_TIP)
+        nx, ny = int(nose[0] * w), int(nose[1] * h)
+        cv2.circle(img, (nx, ny), 2, (255, 0, 0), -1)
+
+        return img
 
 
 class VideoWidget(QtWidgets.QWidget):
@@ -176,7 +351,78 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
 
+        # Settings dock (brightness / contrast for now)
+        self._create_settings_dock()
+
         self.thread.start()
+
+    def _create_settings_dock(self):
+        dock = QtWidgets.QDockWidget("Image Controls", self)
+        dock.setAllowedAreas(
+            QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea
+        )
+
+        widget = QtWidgets.QWidget(dock)
+        layout = QtWidgets.QFormLayout(widget)
+
+        # Brightness: -100..100
+        self.brightness_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.brightness_slider.setRange(-100, 100)
+        self.brightness_slider.setValue(0)
+        self.brightness_spin = QtWidgets.QSpinBox()
+        self.brightness_spin.setRange(-100, 100)
+        self.brightness_spin.setValue(0)
+
+        # Keep slider and spinbox in sync
+        self.brightness_slider.valueChanged.connect(self.brightness_spin.setValue)
+        self.brightness_spin.valueChanged.connect(self.brightness_slider.setValue)
+
+        # Send updates to worker
+        self.brightness_slider.valueChanged.connect(self.worker.set_brightness)
+
+        # Contrast: 0.5..2.0 mapped to slider 50..200
+        self.contrast_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.contrast_slider.setRange(50, 200)
+        self.contrast_slider.setValue(100)  # 1.0
+        self.contrast_spin = QtWidgets.QDoubleSpinBox()
+        self.contrast_spin.setRange(0.5, 2.0)
+        self.contrast_spin.setSingleStep(0.1)
+        self.contrast_spin.setValue(1.0)
+
+        # Sync slider <-> spinbox
+        def on_contrast_slider(val: int):
+            self.contrast_spin.blockSignals(True)
+            self.contrast_spin.setValue(val / 100.0)
+            self.contrast_spin.blockSignals(False)
+
+        def on_contrast_spin(val: float):
+            slider_val = int(val * 100)
+            self.contrast_slider.blockSignals(True)
+            self.contrast_slider.setValue(slider_val)
+            self.contrast_slider.blockSignals(False)
+
+        self.contrast_slider.valueChanged.connect(on_contrast_slider)
+        self.contrast_spin.valueChanged.connect(on_contrast_spin)
+
+        # Send to worker
+        self.contrast_slider.valueChanged.connect(self.worker.set_contrast_slider)
+        self.contrast_spin.valueChanged.connect(self.worker.set_contrast)
+
+        layout.addRow("Brightness", self._hbox(self.brightness_slider, self.brightness_spin))
+        layout.addRow("Contrast", self._hbox(self.contrast_slider, self.contrast_spin))
+
+        widget.setLayout(layout)
+        dock.setWidget(widget)
+        self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
+
+    @staticmethod
+    def _hbox(*widgets):
+        box = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        for w in widgets:
+            layout.addWidget(w)
+        return box
 
     @QtCore.Slot(str)
     def on_worker_error(self, msg: str):
@@ -201,7 +447,7 @@ class MainWindow(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow()
-    win.resize(960, 720)
+    win.resize(1200, 800)
     win.show()
     sys.exit(app.exec())
 
