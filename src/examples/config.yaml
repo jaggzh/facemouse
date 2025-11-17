@@ -1,0 +1,41 @@
+# ~/.config/eye_gaze_tracker/config.yaml
+
+calibration:
+  mode: full  # quick4, quick9, full
+  points: []  # List of (screen_x, screen_y, gaze_data) tuples
+  last_calibrated: "2025-11-17T10:30:00"
+
+tracking:
+  two_eye_mode:
+    enabled: true
+    smoothing_alpha: 0.2
+    
+  one_eye_mode:
+    enabled: true
+    smoothing_alpha: 0.15  # Slightly more aggressive smoothing
+    fallback_eye: "left"  # Prefer left if both unavailable
+    
+  one_drop_threshold: 5  # Frames before switching to one-eye mode
+  
+  head_refinement:
+    enabled: true
+    sensitivity_x: 50  # Pixels per unit head rotation
+    sensitivity_y: 50
+    max_adjustment: 100  # Max pixels head can adjust
+
+filters:
+  adaptive_smoothing: true
+  kalman_filter: false
+  median_filter:
+    enabled: true
+    window_size: 3
+
+image_adjustments:
+  brightness: 0
+  contrast: 1.0
+  
+visualization:
+  show_gaze_trail: true
+  trail_length: 30
+  show_landmarks: false
+  show_face_aim: true

@@ -14,13 +14,35 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import camsettingsh264 as camsettings
 
 
+# ---- Visualization and processing constants ----
+
+# Landmark colors (B, G, R)
+COLOR_LM_ALL = (64, 64, 255)
+COLOR_LM_USED = (0, 255, 255)
+
+# Gaze vectors
+COLOR_GAZE_LEFT = (0, 255, 0)
+COLOR_GAZE_RIGHT = (0, 200, 255)
+COLOR_GAZE_AVG = (255, 255, 0)
+COLOR_FACE_AIM = (255, 0, 255)
+
+# Opacity for landmark overlay (0..1)
+ALPHA_LANDMARKS = 0.5
+
+# Scale for vectors in pixels (debug visualization)
+GAZE_VECTOR_SCALE_PX = 120
+FACE_VECTOR_SCALE_PX = 140
+
+
 # Mediapipe face / eye landmark indices (canonical face mesh + iris)
-LEFT_IRIS = [474, 475, 476, 477]
-RIGHT_IRIS = [469, 470, 471, 472]
-LEFT_EYE_CORNERS = [33, 133]
-RIGHT_EYE_CORNERS = [362, 263]
-LEFT_EYE_LIDS = [159, 145]
-RIGHT_EYE_LIDS = [386, 374]
+LEFT_IRIS = [474, 475, 476, 477] # outer, top, inner, bottom (clockwise)
+LEFT_PUPIL = 473
+RIGHT_IRIS = [469, 470, 471, 472] # inner, top, outer, bottom (counter-clockwise)
+RIGHT_PUPIL = 468
+RIGHT_EYE_CORNERS = [33, 133] # Outer, inner
+LEFT_EYE_CORNERS = [263, 362] # Outer, inner
+LEFT_EYE_LIDS = [386, 374] # Top, bottom
+RIGHT_EYE_LIDS = [159, 145] # Top, bottom
 NOSE_TIP = 1
 
 
@@ -43,6 +65,10 @@ class VideoWorker(QtCore.QObject):
 
         # Eye open ratio threshold (height / width) for blink / eye-closed detection
         self._eye_open_thresh = 0.20
+
+        # Landmark visualization toggles
+        self._show_landmarks_all = False
+        self._show_landmarks_used = True
 
         # Mediapipe face mesh setup
         mp_face_mesh = mp.solutions.face_mesh
@@ -69,6 +95,14 @@ class VideoWorker(QtCore.QObject):
     @QtCore.Slot(float)
     def set_contrast(self, value: float):
         self._contrast = float(value)
+
+    @QtCore.Slot(bool)
+    def set_show_landmarks_all(self, enabled: bool):
+        self._show_landmarks_all = bool(enabled)
+
+    @QtCore.Slot(bool)
+    def set_show_landmarks_used(self, enabled: bool):
+        self._show_landmarks_used = bool(enabled)
 
     # ---- Core loop ----
 
@@ -110,11 +144,11 @@ class VideoWorker(QtCore.QObject):
 
                     img = frame.to_ndarray(format="bgr24")
 
-                    # Brightness / contrast pre-filter
-                    alpha = self._contrast
-                    beta = self._brightness
-                    if not math.isclose(alpha, 1.0) or not math.isclose(beta, 0.0):
-                        img = cv2.convertScaleAbs(img, alpha=alpha, beta=beta)
+                    # Brightness / contrast pre-filter (always apply;
+                    # default values are neutral)
+                    img = cv2.convertScaleAbs(
+                        img, alpha=self._contrast, beta=self._brightness
+                    )
 
                     # Run Mediapipe and draw overlays (eyes, gaze vectors)
                     try:
@@ -167,6 +201,14 @@ class VideoWorker(QtCore.QObject):
             p = face_landmarks.landmark[idx]
             return np.array([p.x, p.y, p.z], dtype=np.float32)
 
+        # Draw all landmarks (into a separate overlay) if enabled
+        overlay = img.copy()
+        if self._show_landmarks_all:
+            for idx, p in enumerate(face_landmarks.landmark):
+                x = int(p.x * w)
+                y = int(p.y * h)
+                cv2.circle(overlay, (x, y), 1, COLOR_LM_ALL, -1)
+
         # Helper to compute eye metrics given index sets
         def eye_info(iris_idx, corners_idx, lids_idx):
             iris_pts = np.array([lm(i) for i in iris_idx], dtype=np.float32)
@@ -185,7 +227,8 @@ class VideoWorker(QtCore.QObject):
             # Relative iris position within eye, normalized
             # 0 = centered; +/- ~1 toward corners/lids
             horiz = (iris_center[0] - eye_center[0]) / (width / 2.0)
-            vert = (iris_center[1] - eye_center[1]) / ((open_height + 1e-6) / 2.0)
+            # Invert vertical sign so looking up is negative vy
+            vert = (iris_center[1] - eye_center[1]) / (width / 2.0)
 
             # Pixel coordinates
             eye_px = (int(eye_center[0] * w), int(eye_center[1] * h))
@@ -196,29 +239,51 @@ class VideoWorker(QtCore.QObject):
                 "eye_px": eye_px,
                 "open_ratio": open_ratio,
                 "dir_norm": np.array([horiz, vert], dtype=np.float32),
+                "corners_idx": corners_idx,
+                "lids_idx": lids_idx,
+                "iris_idx": iris_idx,
             }
 
         left = eye_info(LEFT_IRIS, LEFT_EYE_CORNERS, LEFT_EYE_LIDS)
         right = eye_info(RIGHT_IRIS, RIGHT_EYE_CORNERS, RIGHT_EYE_LIDS)
+
+        # Highlight the specific landmarks we are using, if requested
+        if self._show_landmarks_used:
+            def draw_used(info):
+                for idx in (
+                    list(info["iris_idx"])
+                    + list(info["corners_idx"])
+                    + list(info["lids_idx"])
+                ):
+                    p = face_landmarks.landmark[idx]
+                    x = int(p.x * w)
+                    y = int(p.y * h)
+                    cv2.circle(overlay, (x, y), 2, COLOR_LM_USED, -1)
+
+            draw_used(left)
+            draw_used(right)
+
+        # Blend overlay back onto image for landmarks
+        img = cv2.addWeighted(overlay, ALPHA_LANDMARKS, img, 1.0 - ALPHA_LANDMARKS, 0)
 
         # Simple blink / eye-closed detection
         left_open = left["open_ratio"] > self._eye_open_thresh
         right_open = right["open_ratio"] > self._eye_open_thresh
 
         # Draw per-eye gaze vectors (in normalized eye space)
-        scale_px = 20
-
         def draw_eye_vector(info, is_open: bool, color):
             cx, cy = info["eye_px"]
             vx, vy = info["dir_norm"]
 
             if is_open:
                 end_pt = (
-                    int(cx + vx * scale_px),
-                    int(cy + vy * scale_px),
+                    int(cx + vx * GAZE_VECTOR_SCALE_PX),
+                    int(cy + vy * GAZE_VECTOR_SCALE_PX),
                 )
                 cv2.circle(img, (cx, cy), 2, color, -1)
                 cv2.line(img, (cx, cy), end_pt, color, 2, cv2.LINE_AA)
+                # distal dot
+                cv2.circle(img, end_pt, 3, color, -1)
 
                 label = f"{vx:+.2f},{vy:+.2f} ({info['open_ratio']:.2f})"
                 cv2.putText(
@@ -244,8 +309,8 @@ class VideoWorker(QtCore.QObject):
                     cv2.LINE_AA,
                 )
 
-        draw_eye_vector(left, left_open, (0, 255, 0))
-        draw_eye_vector(right, right_open, (0, 200, 255))
+        draw_eye_vector(left, left_open, COLOR_GAZE_LEFT)
+        draw_eye_vector(right, right_open, COLOR_GAZE_RIGHT)
 
         # Combined gaze (average of open eyes) – for now just a debug indicator
         open_dirs = []
@@ -260,25 +325,49 @@ class VideoWorker(QtCore.QObject):
             avg_center = np.mean(np.array(centers_px, dtype=np.float32), axis=0)
             acx, acy = int(avg_center[0]), int(avg_center[1])
             end_pt = (
-                int(acx + avg_dir[0] * scale_px * 1.2),
-                int(acy + avg_dir[1] * scale_px * 1.2),
+                int(acx + avg_dir[0] * GAZE_VECTOR_SCALE_PX * 1.2),
+                int(acy + avg_dir[1] * GAZE_VECTOR_SCALE_PX * 1.2),
             )
-            cv2.line(img, (acx, acy), end_pt, (255, 255, 0), 2, cv2.LINE_AA)
+            cv2.line(img, (acx, acy), end_pt, COLOR_GAZE_AVG, 2, cv2.LINE_AA)
+            cv2.circle(img, end_pt, 3, COLOR_GAZE_AVG, -1)
             cv2.putText(
                 img,
                 f"avg {avg_dir[0]:+.2f},{avg_dir[1]:+.2f}",
                 (end_pt[0] + 5, end_pt[1]),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.4,
-                (255, 255, 0),
+                COLOR_GAZE_AVG,
                 1,
                 cv2.LINE_AA,
             )
 
-        # Optional: draw a tiny nose marker for reference
+        # Approximate face aim using a simple plane normal from eyes + nose
+        left_eye_center = 0.5 * (lm(LEFT_EYE_CORNERS[0]) + lm(LEFT_EYE_CORNERS[1]))
+        right_eye_center = 0.5 * (
+            lm(RIGHT_EYE_CORNERS[0]) + lm(RIGHT_EYE_CORNERS[1])
+        )
         nose = lm(NOSE_TIP)
+
+        v1 = right_eye_center - left_eye_center
+        v2 = nose - left_eye_center
+        n = np.cross(v1, v2)
+        # Flip so "forward" roughly means toward camera (negative z)
+        if n[2] > 0:
+            n = -n
+
+        # Use x,y components as a rough 2D direction for debug
+        face_dir = np.array([n[0], n[1]], dtype=np.float32)
+        norm = np.linalg.norm(face_dir) + 1e-6
+        face_dir /= norm
+
         nx, ny = int(nose[0] * w), int(nose[1] * h)
-        cv2.circle(img, (nx, ny), 2, (255, 0, 0), -1)
+        face_end = (
+            int(nx + face_dir[0] * FACE_VECTOR_SCALE_PX),
+            int(ny + face_dir[1] * FACE_VECTOR_SCALE_PX),
+        )
+        cv2.circle(img, (nx, ny), 3, COLOR_FACE_AIM, -1)
+        cv2.line(img, (nx, ny), face_end, COLOR_FACE_AIM, 2, cv2.LINE_AA)
+        cv2.circle(img, face_end, 3, COLOR_FACE_AIM, -1)
 
         return img
 
@@ -351,13 +440,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
 
-        # Settings dock (brightness / contrast for now)
+        # Settings dock (brightness / contrast and landmark toggles)
         self._create_settings_dock()
 
         self.thread.start()
 
     def _create_settings_dock(self):
-        dock = QtWidgets.QDockWidget("Image Controls", self)
+        dock = QtWidgets.QDockWidget("Image / Overlay Controls", self)
         dock.setAllowedAreas(
             QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea
         )
@@ -408,8 +497,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.contrast_slider.valueChanged.connect(self.worker.set_contrast_slider)
         self.contrast_spin.valueChanged.connect(self.worker.set_contrast)
 
+        # Landmark toggles
+        self.show_all_lm_cb = QtWidgets.QCheckBox("Show all landmarks")
+        self.show_all_lm_cb.setChecked(False)
+        self.show_used_lm_cb = QtWidgets.QCheckBox("Highlight gaze landmarks")
+        self.show_used_lm_cb.setChecked(True)
+
+        self.show_all_lm_cb.toggled.connect(self.worker.set_show_landmarks_all)
+        self.show_used_lm_cb.toggled.connect(self.worker.set_show_landmarks_used)
+
         layout.addRow("Brightness", self._hbox(self.brightness_slider, self.brightness_spin))
         layout.addRow("Contrast", self._hbox(self.contrast_slider, self.contrast_spin))
+        layout.addRow(self.show_all_lm_cb)
+        layout.addRow(self.show_used_lm_cb)
 
         widget.setLayout(layout)
         dock.setWidget(widget)
