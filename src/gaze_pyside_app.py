@@ -3,6 +3,7 @@
 import sys
 import time
 import math
+import argparse
 
 import av  # pip install av
 import numpy as np
@@ -47,7 +48,7 @@ NOSE_TIP = 1
 
 
 class VideoWorker(QtCore.QObject):
-    """Background worker: decodes H.264, applies pre-filter, runs Mediapipe,
+    """Background worker: decodes H.264 or video file, applies pre-filter, runs Mediapipe,
     draws debug overlays, and emits annotated frames as NumPy arrays (BGR).
     """
 
@@ -55,13 +56,16 @@ class VideoWorker(QtCore.QObject):
     error = QtCore.Signal(str)
     finished = QtCore.Signal()
 
-    def __init__(self, parent=None):
+    def __init__(self, video_file=None, parent=None):
         super().__init__(parent)
         self._running = False
+        self._video_file = video_file
 
         # Image pre-filter controls (alpha, beta for convertScaleAbs)
         self._contrast = 1.0  # alpha
         self._brightness = 0.0  # beta
+        self._contrast_lock = QtCore.QMutex()
+        self._brightness_lock = QtCore.QMutex()
 
         # Eye open ratio threshold (height / width) for blink / eye-closed detection
         self._eye_open_thresh = 0.20
@@ -85,16 +89,22 @@ class VideoWorker(QtCore.QObject):
     @QtCore.Slot(int)
     def set_brightness(self, value: int):
         # direct mapping: slider -100..100 -> beta -100..100
-        self._brightness = float(value)
+        with QtCore.QMutexLocker(self._brightness_lock):
+            self._brightness = float(value)
+            print(f"[Worker] Brightness set to {self._brightness}")
 
     @QtCore.Slot(int)
     def set_contrast_slider(self, value: int):
         # slider 50..200 -> alpha 0.5..2.0
-        self._contrast = float(value) / 100.0
+        with QtCore.QMutexLocker(self._contrast_lock):
+            self._contrast = float(value) / 100.0
+            print(f"[Worker] Contrast set to {self._contrast}")
 
     @QtCore.Slot(float)
     def set_contrast(self, value: float):
-        self._contrast = float(value)
+        with QtCore.QMutexLocker(self._contrast_lock):
+            self._contrast = float(value)
+            print(f"[Worker] Contrast set to {self._contrast}")
 
     @QtCore.Slot(bool)
     def set_show_landmarks_all(self, enabled: bool):
@@ -110,6 +120,71 @@ class VideoWorker(QtCore.QObject):
     def start(self):
         self._running = True
 
+        if self._video_file:
+            # Process video file
+            self._process_video_file()
+        else:
+            # Process camera stream
+            self._process_camera_stream()
+
+        self.finished.emit()
+        print("[Worker] Stopped")
+
+    def _process_video_file(self):
+        """Process a video file (for testing)."""
+        print(f"[Worker] Opening video file: {self._video_file}")
+        
+        while self._running:
+            try:
+                container = av.open(self._video_file)
+            except av.AVError as e:
+                msg = f"Failed to open video file: {e}"
+                print("[Worker]", msg)
+                self.error.emit(msg)
+                break
+
+            print("[Worker] Video file opened, starting decode loop")
+
+            try:
+                for frame in container.decode(video=0):
+                    if not self._running:
+                        break
+
+                    img = frame.to_ndarray(format="bgr24")
+
+                    # Apply brightness/contrast adjustments
+                    img = self._apply_image_adjustments(img)
+
+                    # Run Mediapipe and draw overlays
+                    try:
+                        img = self._process_and_overlay(img)
+                    except Exception as e:
+                        self.error.emit(f"Processing error: {e}")
+
+                    # Emit the annotated frame
+                    self.frameReady.emit(img)
+
+                    # For low FPS test videos, add a small delay to make it viewable
+                    # Adjust this if your test video is truly 1 fps
+                    #time.sleep(0.033)  # ~30 fps display rate
+                    time.sleep(1)  # ~30 fps display rate
+
+            except av.AVError as e:
+                msg = f"Decode error: {e}"
+                print("[Worker]", msg)
+                self.error.emit(msg)
+
+            finally:
+                try:
+                    container.close()
+                except Exception:
+                    pass
+
+            # For file playback, stop after one pass
+            break
+
+    def _process_camera_stream(self):
+        """Process live camera stream."""
         host = camsettings.camhost
         port = camsettings.camport
         url = f"tcp://{host}:{port}"
@@ -131,7 +206,6 @@ class VideoWorker(QtCore.QObject):
                 msg = f"Failed to open stream: {e}"
                 print("[Worker]", msg)
                 self.error.emit(msg)
-                # back off a bit then retry
                 time.sleep(1.0)
                 continue
 
@@ -144,17 +218,13 @@ class VideoWorker(QtCore.QObject):
 
                     img = frame.to_ndarray(format="bgr24")
 
-                    # Brightness / contrast pre-filter (always apply;
-                    # default values are neutral)
-                    img = cv2.convertScaleAbs(
-                        img, alpha=self._contrast, beta=self._brightness
-                    )
+                    # Apply brightness/contrast adjustments
+                    img = self._apply_image_adjustments(img)
 
-                    # Run Mediapipe and draw overlays (eyes, gaze vectors)
+                    # Run Mediapipe and draw overlays
                     try:
                         img = self._process_and_overlay(img)
                     except Exception as e:
-                        # Don't kill the stream if Mediapipe / drawing hiccups
                         self.error.emit(f"Processing error: {e}")
 
                     # Emit the annotated frame
@@ -171,13 +241,21 @@ class VideoWorker(QtCore.QObject):
                 except Exception:
                     pass
 
-            # If still running, we will loop and try to reconnect
+            # If still running, reconnect
             if self._running:
                 print("[Worker] Will attempt to reconnect in 1s")
                 time.sleep(1.0)
 
-        self.finished.emit()
-        print("[Worker] Stopped")
+    def _apply_image_adjustments(self, img: np.ndarray) -> np.ndarray:
+        """Apply brightness and contrast adjustments to the image."""
+        with QtCore.QMutexLocker(self._contrast_lock):
+            contrast = self._contrast
+        with QtCore.QMutexLocker(self._brightness_lock):
+            brightness = self._brightness
+        
+        # Apply the adjustments
+        adjusted = cv2.convertScaleAbs(img, alpha=contrast, beta=brightness)
+        return adjusted
 
     def stop(self):
         self._running = False
@@ -408,9 +486,9 @@ class VideoWidget(QtWidgets.QWidget):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, video_file=None):
         super().__init__()
-        self.setWindowTitle("Eye Gaze Prototype")
+        self.setWindowTitle("Eye Gaze Prototype - Accessibility HID Controller")
 
         # Central video widget
         self.video_widget = VideoWidget(self)
@@ -425,11 +503,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Status bar for basic info / errors
         self.status = self.statusBar()
-        self.status.showMessage("Connecting to camera...")
+        if video_file:
+            self.status.showMessage(f"Loading video file: {video_file}")
+        else:
+            self.status.showMessage("Connecting to camera...")
 
         # Thread + worker setup
         self.thread = QtCore.QThread(self)
-        self.worker = VideoWorker()
+        self.worker = VideoWorker(video_file=video_file)
         self.worker.moveToThread(self.thread)
 
         # Connect signals
@@ -545,8 +626,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Eye Gaze Tracker - Accessibility HID Controller Prototype"
+    )
+    parser.add_argument(
+        "-f", "--file",
+        type=str,
+        help="Path to video file for testing (instead of live camera stream)"
+    )
+    
+    args = parser.parse_args()
+    
     app = QtWidgets.QApplication(sys.argv)
-    win = MainWindow()
+    win = MainWindow(video_file=args.file)
     win.resize(1200, 800)
     win.show()
     sys.exit(app.exec())
