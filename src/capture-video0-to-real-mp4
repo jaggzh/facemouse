@@ -1,1 +1,1 @@
-ffmpeg -f video4linux2 -framerate 15 -i /dev/video0 img-refs/real.mp4
+ffmpeg -f video4linux2 -framerate 10 -i /dev/video0 img-refs/real.mp4
