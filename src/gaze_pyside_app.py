@@ -407,7 +407,7 @@ class VideoWorker(QtCore.QObject):
             for idx, p in enumerate(face_landmarks.landmark):
                 x = int(p.x * w)
                 y = int(p.y * h)
-                cv2.circle(overlay, (x, y), DEF_LM_SIZE, COLOR_LM_ALL, -1)
+                cv2.circle(overlay, (x, y), DEF_LM_SIZE*2, COLOR_LM_ALL, -1)
 
         # Helper to compute eye metrics given index sets
         def eye_info(iris_idx, corners_idx, lids_idx):
