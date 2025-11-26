@@ -32,6 +32,7 @@ import mediapipe as mp
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import camsettingsh264 as camsettings
+import filters
 
 
 # ============================================================================
@@ -40,6 +41,15 @@ import camsettingsh264 as camsettings
 DEF_VFILE_FRAME_DELAY = 1.0  # Delay between frames in seconds (for video files)
 DEF_VFILE_FPS = None  # FPS for video file playback (None = use frame delay)
 DEF_VFILE_LOOP = True  # Loop video files by default
+
+# Landmark filtering defaults
+DEF_FILTER_ENABLED = True
+DEF_MEDIAN_WINDOW = 3  # Number of samples for median filter
+DEF_EMA_ALPHA = 0.3  # Exponential moving average (0=very smooth, 1=no smoothing)
+
+# Image adjustment defaults
+DEF_BRIGHTNESS = 0  # -100 to 100
+DEF_CONTRAST = 1.0  # 0.5 to 2.0
 
 
 # ============================================================================
@@ -74,11 +84,26 @@ LEFT_IRIS = [474, 475, 476, 477] # outer, top, inner, bottom (clockwise)
 LEFT_PUPIL = 473
 RIGHT_IRIS = [469, 470, 471, 472] # inner, top, outer, bottom (counter-clockwise)
 RIGHT_PUPIL = 468
-RIGHT_EYE_CORNERS = [33, 133] # Outer, inner
-LEFT_EYE_CORNERS = [263, 362] # Outer, inner
+# Expanded eye corners with adjacent points
+RIGHT_EYE_CORNERS = [133, 243, 189, 244, 33, 130] # Inner corners + adjacent, outer + adjacent
+LEFT_EYE_CORNERS = [362, 463, 413, 464, 263, 359] # Inner corners + adjacent, outer + adjacent
 LEFT_EYE_LIDS = [386, 374] # Top, bottom
 RIGHT_EYE_LIDS = [159, 145] # Top, bottom
 NOSE_TIP = 1
+
+# Split for separate coloring
+LEFT_EYE_CORNERS_INNER = [362, 463, 413, 464]
+LEFT_EYE_CORNERS_OUTER = [263, 359]
+RIGHT_EYE_CORNERS_INNER = [133, 243, 189, 244]
+RIGHT_EYE_CORNERS_OUTER = [33, 130]
+
+# Face orientation landmarks
+NOSE_TIP_POINTS = [1, 2, 4]
+CHEEKBONE_R = [34, 143, 116]
+CHEEKBONE_L = [254, 372, 345]
+FOREHEAD_TOP_R = 103
+FOREHEAD_TOP_L = 332
+CHIN_TIP_POINTS = [203, 428, 175]
 
 
 class VideoWorker(QtCore.QObject):
@@ -108,10 +133,18 @@ class VideoWorker(QtCore.QObject):
         self._playback_lock = QtCore.QMutex()
 
         # Image pre-filter controls (alpha, beta for convertScaleAbs)
-        self._contrast = 1.0  # alpha
-        self._brightness = 0.0  # beta
+        self._contrast = DEF_CONTRAST  # alpha
+        self._brightness = DEF_BRIGHTNESS  # beta
         self._contrast_lock = QtCore.QMutex()
         self._brightness_lock = QtCore.QMutex()
+
+        # Landmark filtering
+        self._landmark_filter = filters.LandmarkFilterSet(
+            median_window=DEF_MEDIAN_WINDOW,
+            ema_alpha=DEF_EMA_ALPHA,
+            enabled=DEF_FILTER_ENABLED
+        )
+        self._filter_lock = QtCore.QMutex()
 
         # Eye open ratio threshold (height / width) for blink / eye-closed detection
         self._eye_open_thresh = 0.20
@@ -136,16 +169,19 @@ class VideoWorker(QtCore.QObject):
     def set_brightness(self, value: int):
         with QtCore.QMutexLocker(self._brightness_lock):
             self._brightness = float(value)
+            print(f"[Worker] Brightness set to {self._brightness}")
 
     @QtCore.Slot(int)
     def set_contrast_slider(self, value: int):
         with QtCore.QMutexLocker(self._contrast_lock):
             self._contrast = float(value) / 100.0
+            print(f"[Worker] Contrast set to {self._contrast}")
 
     @QtCore.Slot(float)
     def set_contrast(self, value: float):
         with QtCore.QMutexLocker(self._contrast_lock):
             self._contrast = float(value)
+            print(f"[Worker] Contrast set to {self._contrast}")
 
     @QtCore.Slot(bool)
     def set_show_landmarks_all(self, enabled: bool):
@@ -154,6 +190,26 @@ class VideoWorker(QtCore.QObject):
     @QtCore.Slot(bool)
     def set_show_landmarks_used(self, enabled: bool):
         self._show_landmarks_used = bool(enabled)
+
+    # ---- Slots for landmark filter parameters ----
+
+    @QtCore.Slot(bool)
+    def set_filter_enabled(self, enabled: bool):
+        with QtCore.QMutexLocker(self._filter_lock):
+            self._landmark_filter.set_parameters(enabled=enabled)
+            print(f"[Worker] Filtering {'enabled' if enabled else 'disabled'}")
+
+    @QtCore.Slot(int)
+    def set_median_window(self, value: int):
+        with QtCore.QMutexLocker(self._filter_lock):
+            self._landmark_filter.set_parameters(median_window=value)
+            print(f"[Worker] Median window set to {value}")
+
+    @QtCore.Slot(float)
+    def set_ema_alpha(self, value: float):
+        with QtCore.QMutexLocker(self._filter_lock):
+            self._landmark_filter.set_parameters(ema_alpha=value)
+            print(f"[Worker] EMA alpha set to {value:.3f}")
 
     # ---- Video playback control slots ----
 
@@ -397,9 +453,24 @@ class VideoWorker(QtCore.QObject):
 
         face_landmarks = results.multi_face_landmarks[0]
 
+        # Dynamic landmark scaling based on resolution
+        base_lm_scaler = min(1.0, w / 750.0)
+        lm_size = max(1, int(DEF_LM_SIZE * base_lm_scaler))
+        lm_special_size = max(1, int(DEF_LM_SIZE * DEF_LM_SPECIAL_SCALE * base_lm_scaler))
+        vector_end_size = max(1, int(DEF_VECTOR_END_SIZE * base_lm_scaler))
+
         def lm(idx: int):
             p = face_landmarks.landmark[idx]
-            return np.array([p.x, p.y, p.z], dtype=np.float32)
+            raw_point = np.array([p.x, p.y, p.z], dtype=np.float32)
+            # Apply filtering
+            with QtCore.QMutexLocker(self._filter_lock):
+                filtered_point = self._landmark_filter.update(idx, raw_point)
+            return filtered_point
+        
+        def lm_avg(indices):
+            """Average position of multiple landmarks."""
+            pts = np.array([lm(i) for i in indices], dtype=np.float32)
+            return pts.mean(axis=0)
 
         # Draw all landmarks (into a separate overlay) if enabled
         overlay = img.copy()
@@ -407,17 +478,22 @@ class VideoWorker(QtCore.QObject):
             for idx, p in enumerate(face_landmarks.landmark):
                 x = int(p.x * w)
                 y = int(p.y * h)
-                cv2.circle(overlay, (x, y), DEF_LM_SIZE*2, COLOR_LM_ALL, -1)
+                cv2.circle(overlay, (x, y), lm_size, COLOR_LM_ALL, -1)
 
         # Helper to compute eye metrics given index sets
-        def eye_info(iris_idx, corners_idx, lids_idx):
+        def eye_info(iris_idx, pupil_idx, corners_idx, lids_idx):
+            # Include pupil in iris center calculation
             iris_pts = np.array([lm(i) for i in iris_idx], dtype=np.float32)
-            iris_center = iris_pts.mean(axis=0)
+            pupil_pt = lm(pupil_idx)
+            all_iris_pts = np.vstack([iris_pts, pupil_pt.reshape(1, -1)])
+            iris_center = all_iris_pts.mean(axis=0)
 
-            c0, c1 = lm(corners_idx[0]), lm(corners_idx[1])
-            eye_center = 0.5 * (c0 + c1)
+            # Eye center from all corner points
+            corner_pts = np.array([lm(i) for i in corners_idx], dtype=np.float32)
+            eye_center = corner_pts.mean(axis=0)
 
-            # Horizontal eye width in normalized coords
+            # Horizontal eye width in normalized coords (use outermost corners)
+            c0, c1 = corner_pts[0], corner_pts[-1]
             width = np.linalg.norm(c0[:2] - c1[:2]) + 1e-6
 
             lt, lb = lm(lids_idx[0]), lm(lids_idx[1])
@@ -442,29 +518,52 @@ class VideoWorker(QtCore.QObject):
                 "corners_idx": corners_idx,
                 "lids_idx": lids_idx,
                 "iris_idx": iris_idx,
+                "pupil_idx": pupil_idx,
             }
 
-        left = eye_info(LEFT_IRIS, LEFT_EYE_CORNERS, LEFT_EYE_LIDS)
-        right = eye_info(RIGHT_IRIS, RIGHT_EYE_CORNERS, RIGHT_EYE_LIDS)
+        left = eye_info(LEFT_IRIS, LEFT_PUPIL, LEFT_EYE_CORNERS, LEFT_EYE_LIDS)
+        right = eye_info(RIGHT_IRIS, RIGHT_PUPIL, RIGHT_EYE_CORNERS, RIGHT_EYE_LIDS)
 
         # Highlight the specific landmarks we are using, if requested
         # Draw them with darker versions of their associated vector colors
         if self._show_landmarks_used:
-            def darken_color(color_bgr):
+            def darken_color(color_bgr, factor=DEF_LM_SPECIAL_BRIGHTNESS):
                 """Make color darker by brightness factor."""
-                return tuple(int(c * DEF_LM_SPECIAL_BRIGHTNESS) for c in color_bgr)
+                return tuple(int(c * factor) for c in color_bgr)
+            
+            def shift_hue_bgr(color_bgr, shift_degrees=30):
+                """Shift BGR color hue in HSV space."""
+                # Convert single color to image format for cv2
+                pixel = np.uint8([[color_bgr]])
+                hsv = cv2.cvtColor(pixel, cv2.COLOR_BGR2HSV)
+                hsv[0, 0, 0] = (hsv[0, 0, 0] + shift_degrees) % 180  # Hue in OpenCV is 0-179
+                bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+                return tuple(int(x) for x in bgr[0, 0])
             
             def draw_used(info, vector_color):
-                darker_color = darken_color(vector_color)
-                for idx in (
-                    list(info["iris_idx"])
-                    + list(info["corners_idx"])
-                    + list(info["lids_idx"])
-                ):
+                # Iris + pupil: darker version of gaze color
+                iris_color = darken_color(vector_color, 0.7)
+                for idx in list(info["iris_idx"]) + [info["pupil_idx"]]:
                     p = face_landmarks.landmark[idx]
                     x = int(p.x * w)
                     y = int(p.y * h)
-                    cv2.circle(overlay, (x, y), DEF_LM_SIZE * DEF_LM_SPECIAL_SCALE, darker_color, -1)
+                    cv2.circle(overlay, (x, y), lm_special_size, iris_color, -1)
+                
+                # Corners: darker + hue shifted for distinctiveness
+                corner_color = shift_hue_bgr(darken_color(vector_color, 0.6), 40)
+                for idx in info["corners_idx"]:
+                    p = face_landmarks.landmark[idx]
+                    x = int(p.x * w)
+                    y = int(p.y * h)
+                    cv2.circle(overlay, (x, y), lm_special_size, corner_color, -1)
+                
+                # Lids: similar to iris
+                lid_color = darken_color(vector_color, 0.65)
+                for idx in info["lids_idx"]:
+                    p = face_landmarks.landmark[idx]
+                    x = int(p.x * w)
+                    y = int(p.y * h)
+                    cv2.circle(overlay, (x, y), lm_special_size, lid_color, -1)
 
             draw_used(left, COLOR_GAZE_LEFT)
             draw_used(right, COLOR_GAZE_RIGHT)
@@ -489,7 +588,7 @@ class VideoWorker(QtCore.QObject):
                 cv2.circle(img, (cx, cy), 2, color, -1)
                 cv2.line(img, (cx, cy), end_pt, color, 2, cv2.LINE_AA)
                 # distal dot
-                cv2.circle(img, end_pt, DEF_VECTOR_END_SIZE, color, -1)
+                cv2.circle(img, end_pt, vector_end_size, color, -1)
 
                 label = f"{vx:+.2f},{vy:+.2f} ({info['open_ratio']:.2f})"
                 cv2.putText(
@@ -535,7 +634,7 @@ class VideoWorker(QtCore.QObject):
                 int(acy + avg_dir[1] * GAZE_VECTOR_SCALE_PX * 1.2),
             )
             cv2.line(img, (acx, acy), end_pt, COLOR_GAZE_AVG, 2, cv2.LINE_AA)
-            cv2.circle(img, end_pt, DEF_VECTOR_END_SIZE, COLOR_GAZE_AVG, -1)
+            cv2.circle(img, end_pt, vector_end_size, COLOR_GAZE_AVG, -1)
             cv2.putText(
                 img,
                 f"avg {avg_dir[0]:+.2f},{avg_dir[1]:+.2f}",
@@ -547,38 +646,79 @@ class VideoWorker(QtCore.QObject):
                 cv2.LINE_AA,
             )
 
-        # Approximate face aim using a simple plane normal from eyes + nose
-        left_eye_center = 0.5 * (lm(LEFT_EYE_CORNERS[0]) + lm(LEFT_EYE_CORNERS[1]))
-        right_eye_center = 0.5 * (
-            lm(RIGHT_EYE_CORNERS[0]) + lm(RIGHT_EYE_CORNERS[1])
-        )
-        nose = lm(NOSE_TIP)
-
-        v1 = right_eye_center - left_eye_center
-        v2 = nose - left_eye_center
-        n = np.cross(v1, v2)
-        # Flip so "forward" roughly means toward camera (negative z)
-        if n[2] > 0:
-            n = -n
-
-        # Use x,y components as a rough 2D direction for debug
-        face_dir = np.array([n[0], n[1]], dtype=np.float32)
-        norm = np.linalg.norm(face_dir) + 1e-6
-        face_dir /= norm
-
-        nx, ny = int(nose[0] * w), int(nose[1] * h)
+        # New face orientation calculation
+        # Method 1: Cheekbone-to-nose vector
+        cheekbone_r = lm_avg(CHEEKBONE_R)
+        cheekbone_l = lm_avg(CHEEKBONE_L)
+        cheekbone_center = 0.5 * (cheekbone_r + cheekbone_l)
+        nose_tip_point = lm_avg(NOSE_TIP_POINTS)
+        
+        vector_cheeks_nose = nose_tip_point - cheekbone_center
+        vector_cheeks_nose = vector_cheeks_nose / (np.linalg.norm(vector_cheeks_nose) + 1e-6)
+        
+        # Method 2: Forehead-chin plane normal
+        forehead_r = lm(FOREHEAD_TOP_R)
+        forehead_l = lm(FOREHEAD_TOP_L)
+        chin_tip = lm_avg(CHIN_TIP_POINTS)
+        
+        v1 = forehead_l - forehead_r
+        v2 = chin_tip - forehead_r
+        vector_face_normal = np.cross(v1, v2)
+        # Flip if needed so it points roughly forward (negative z)
+        if vector_face_normal[2] > 0:
+            vector_face_normal = -vector_face_normal
+        vector_face_normal = vector_face_normal / (np.linalg.norm(vector_face_normal) + 1e-6)
+        
+        # Combine both methods
+        final_face_vector = 0.5 * (vector_cheeks_nose + vector_face_normal)
+        final_face_vector = final_face_vector / (np.linalg.norm(final_face_vector) + 1e-6)
+        
+        # Use x,y components as 2D direction for display
+        face_dir = np.array([final_face_vector[0], final_face_vector[1]], dtype=np.float32)
+        
+        nx, ny = int(nose_tip_point[0] * w), int(nose_tip_point[1] * h)
         face_end = (
             int(nx + face_dir[0] * FACE_VECTOR_SCALE_PX),
             int(ny + face_dir[1] * FACE_VECTOR_SCALE_PX),
         )
         cv2.circle(img, (nx, ny), 3, COLOR_FACE_AIM, -1)
         cv2.line(img, (nx, ny), face_end, COLOR_FACE_AIM, 2, cv2.LINE_AA)
-        cv2.circle(img, face_end, DEF_VECTOR_END_SIZE, COLOR_FACE_AIM, -1)
+        cv2.circle(img, face_end, vector_end_size, COLOR_FACE_AIM, -1)
         
-        # Draw nose landmark with darker face aim color if requested
+        # Draw face orientation landmarks with darker face aim color if requested
         if self._show_landmarks_used:
             darker_face_color = tuple(int(c * DEF_LM_SPECIAL_BRIGHTNESS) for c in COLOR_FACE_AIM)
-            cv2.circle(overlay, (nx, ny), DEF_LM_SIZE * DEF_LM_SPECIAL_SCALE, darker_face_color, -1)
+            
+            # Cheekbone points
+            for idx in CHEEKBONE_R + CHEEKBONE_L:
+                p = face_landmarks.landmark[idx]
+                x, y = int(p.x * w), int(p.y * h)
+                cv2.circle(overlay, (x, y), lm_special_size, darker_face_color, -1)
+            
+            # Nose tip points
+            for idx in NOSE_TIP_POINTS:
+                p = face_landmarks.landmark[idx]
+                x, y = int(p.x * w), int(p.y * h)
+                cv2.circle(overlay, (x, y), lm_special_size, darker_face_color, -1)
+            
+            # Forehead points
+            for idx in [FOREHEAD_TOP_R, FOREHEAD_TOP_L]:
+                p = face_landmarks.landmark[idx]
+                x, y = int(p.x * w), int(p.y * h)
+                cv2.circle(overlay, (x, y), lm_special_size, darker_face_color, -1)
+            
+            # Chin points
+            for idx in CHIN_TIP_POINTS:
+                p = face_landmarks.landmark[idx]
+                x, y = int(p.x * w), int(p.y * h)
+                cv2.circle(overlay, (x, y), lm_special_size, darker_face_color, -1)
+            
+            # Old eye corner landmarks (for reference/reminder)
+            for idx in RIGHT_EYE_CORNERS + LEFT_EYE_CORNERS:
+                p = face_landmarks.landmark[idx]
+                x, y = int(p.x * w), int(p.y * h)
+                cv2.circle(overlay, (x, y), lm_special_size, darker_face_color, -1)
+            
             # Blend this overlay update
             img = cv2.addWeighted(overlay, ALPHA_LANDMARKS, img, 1.0 - ALPHA_LANDMARKS, 0)
 
@@ -815,26 +955,23 @@ class MainWindow(QtWidgets.QMainWindow):
         # Brightness: -100..100
         self.brightness_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.brightness_slider.setRange(-100, 100)
-        self.brightness_slider.setValue(0)
         self.brightness_spin = QtWidgets.QSpinBox()
         self.brightness_spin.setRange(-100, 100)
-        self.brightness_spin.setValue(0)
 
         # Keep slider and spinbox in sync
         self.brightness_slider.valueChanged.connect(self.brightness_spin.setValue)
         self.brightness_spin.valueChanged.connect(self.brightness_slider.setValue)
 
-        # Send updates to worker
-        self.brightness_slider.valueChanged.connect(self.worker.set_brightness)
+        # Send updates to worker (DirectConnection since worker loop is blocking)
+        self.brightness_slider.valueChanged.connect(
+            self.worker.set_brightness, QtCore.Qt.DirectConnection)
 
         # Contrast: 0.5..2.0 mapped to slider 50..200
         self.contrast_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.contrast_slider.setRange(50, 200)
-        self.contrast_slider.setValue(100)  # 1.0
         self.contrast_spin = QtWidgets.QDoubleSpinBox()
         self.contrast_spin.setRange(0.5, 2.0)
         self.contrast_spin.setSingleStep(0.1)
-        self.contrast_spin.setValue(1.0)
 
         # Sync slider <-> spinbox
         def on_contrast_slider(val: int):
@@ -851,9 +988,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.contrast_slider.valueChanged.connect(on_contrast_slider)
         self.contrast_spin.valueChanged.connect(on_contrast_spin)
 
-        # Send to worker
-        self.contrast_slider.valueChanged.connect(self.worker.set_contrast_slider)
-        self.contrast_spin.valueChanged.connect(self.worker.set_contrast)
+        # Send to worker (DirectConnection since worker loop is blocking)
+        self.contrast_slider.valueChanged.connect(
+            self.worker.set_contrast_slider, QtCore.Qt.DirectConnection)
+        self.contrast_spin.valueChanged.connect(
+            self.worker.set_contrast, QtCore.Qt.DirectConnection)
 
         img_layout.addRow("Brightness", self._hbox(self.brightness_slider, self.brightness_spin))
         img_layout.addRow("Contrast", self._hbox(self.contrast_slider, self.contrast_spin))
@@ -869,8 +1008,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_used_lm_cb = QtWidgets.QCheckBox("Highlight gaze landmarks")
         self.show_used_lm_cb.setChecked(True)
 
-        self.show_all_lm_cb.toggled.connect(self.worker.set_show_landmarks_all)
-        self.show_used_lm_cb.toggled.connect(self.worker.set_show_landmarks_used)
+        self.show_all_lm_cb.toggled.connect(
+            self.worker.set_show_landmarks_all, QtCore.Qt.DirectConnection)
+        self.show_used_lm_cb.toggled.connect(
+            self.worker.set_show_landmarks_used, QtCore.Qt.DirectConnection)
         
         overlay_layout.addWidget(self.show_all_lm_cb)
         overlay_layout.addWidget(self.show_used_lm_cb)
@@ -897,17 +1038,100 @@ class MainWindow(QtWidgets.QMainWindow):
             help_layout.addWidget(help_text)
             help_group.setLayout(help_layout)
         
+        # Landmark filter controls group
+        filter_group = QtWidgets.QGroupBox("Landmark Filtering")
+        filter_layout = QtWidgets.QFormLayout()
+        
+        # Filter enable toggle
+        self.filter_enabled_cb = QtWidgets.QCheckBox("Enable filtering")
+        self.filter_enabled_cb.toggled.connect(
+            self.worker.set_filter_enabled, QtCore.Qt.DirectConnection)
+        filter_layout.addRow(self.filter_enabled_cb)
+        
+        # Median window size: 1..10
+        self.median_window_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.median_window_slider.setRange(1, 10)
+        self.median_window_spin = QtWidgets.QSpinBox()
+        self.median_window_spin.setRange(1, 10)
+        
+        # Sync slider and spinbox
+        self.median_window_slider.valueChanged.connect(self.median_window_spin.setValue)
+        self.median_window_spin.valueChanged.connect(self.median_window_slider.setValue)
+        
+        # Send to worker (DirectConnection since worker loop is blocking)
+        self.median_window_slider.valueChanged.connect(
+            self.worker.set_median_window, QtCore.Qt.DirectConnection)
+        
+        filter_layout.addRow("Median Window", self._hbox(self.median_window_slider, self.median_window_spin))
+        
+        # EMA alpha: 0.01..1.0 (mapped to slider 1..100)
+        self.ema_alpha_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.ema_alpha_slider.setRange(1, 100)
+        self.ema_alpha_spin = QtWidgets.QDoubleSpinBox()
+        self.ema_alpha_spin.setRange(0.01, 1.0)
+        self.ema_alpha_spin.setSingleStep(0.01)
+        
+        # Sync slider <-> spinbox
+        def on_ema_slider(val: int):
+            self.ema_alpha_spin.blockSignals(True)
+            self.ema_alpha_spin.setValue(val / 100.0)
+            self.ema_alpha_spin.blockSignals(False)
+        
+        def on_ema_spin(val: float):
+            slider_val = int(val * 100)
+            self.ema_alpha_slider.blockSignals(True)
+            self.ema_alpha_slider.setValue(slider_val)
+            self.ema_alpha_slider.blockSignals(False)
+        
+        self.ema_alpha_slider.valueChanged.connect(on_ema_slider)
+        self.ema_alpha_spin.valueChanged.connect(on_ema_spin)
+        
+        # Send to worker (DirectConnection since worker loop is blocking)
+        self.ema_alpha_spin.valueChanged.connect(
+            self.worker.set_ema_alpha, QtCore.Qt.DirectConnection)
+        
+        filter_layout.addRow("Smoothing (α)", self._hbox(self.ema_alpha_slider, self.ema_alpha_spin))
+        
+        # Add note about smoothing
+        note_label = QtWidgets.QLabel("Lower α = smoother, higher = more responsive")
+        note_label.setFont(QtGui.QFont("Sans", 8))
+        note_label.setWordWrap(True)
+        filter_layout.addRow(note_label)
+        
+        filter_group.setLayout(filter_layout)
+        
+        # Save/Reset buttons
+        buttons_layout = QtWidgets.QHBoxLayout()
+        
+        self.reset_btn = QtWidgets.QPushButton("Reset to Defaults")
+        self.reset_btn.clicked.connect(self.reset_to_defaults)
+        buttons_layout.addWidget(self.reset_btn)
+        
+        self.save_btn = QtWidgets.QPushButton("Save Settings")
+        self.save_btn.clicked.connect(self.save_settings)
+        buttons_layout.addWidget(self.save_btn)
+        
         # Add all groups to main layout
         layout.addWidget(img_group)
         layout.addWidget(overlay_group)
+        layout.addWidget(filter_group)
         layout.addWidget(legend_group)
         if is_video_file:
             layout.addWidget(help_group)
+        layout.addWidget(QtWidgets.QLabel())  # Spacer
+        layout.addLayout(buttons_layout)
         layout.addStretch()
 
         widget.setLayout(layout)
         dock.setWidget(widget)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, dock)
+        
+        # Trigger initial values to worker (after all connections are made)
+        self.brightness_slider.setValue(DEF_BRIGHTNESS)
+        self.contrast_slider.setValue(int(DEF_CONTRAST * 100))
+        self.filter_enabled_cb.setChecked(DEF_FILTER_ENABLED)
+        self.median_window_slider.setValue(DEF_MEDIAN_WINDOW)
+        self.ema_alpha_slider.setValue(int(DEF_EMA_ALPHA * 100))
 
     @staticmethod
     def _hbox(*widgets):
@@ -921,6 +1145,32 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(str)
     def on_worker_error(self, msg: str):
         self.status.showMessage(msg)
+
+    def reset_to_defaults(self):
+        """Reset all controls to default values."""
+        # Image adjustments
+        self.brightness_slider.setValue(DEF_BRIGHTNESS)
+        self.contrast_slider.setValue(int(DEF_CONTRAST * 100))
+        
+        # Filters
+        self.filter_enabled_cb.setChecked(DEF_FILTER_ENABLED)
+        self.median_window_slider.setValue(DEF_MEDIAN_WINDOW)
+        self.ema_alpha_slider.setValue(int(DEF_EMA_ALPHA * 100))
+        
+        self.status.showMessage("Reset to defaults", 2000)
+
+    def save_settings(self):
+        """Save current settings to config file (placeholder for now)."""
+        # TODO: Implement YAML config save
+        config = {
+            'brightness': self.brightness_slider.value(),
+            'contrast': self.contrast_slider.value() / 100.0,
+            'filter_enabled': self.filter_enabled_cb.isChecked(),
+            'median_window': self.median_window_slider.value(),
+            'ema_alpha': self.ema_alpha_slider.value() / 100.0,
+        }
+        print(f"[UI] Would save config: {config}")
+        self.status.showMessage("Settings saved (not yet implemented)", 2000)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         # Stop worker
