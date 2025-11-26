@@ -37,6 +37,7 @@ import camsettingsh264 as camsettings
 import filters
 import calibration
 import settings as app_settings
+import mouse_control
 
 
 # ============================================================================
@@ -981,9 +982,13 @@ class ColorLegendWidget(QtWidgets.QWidget):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, video_file=None, usb_device=None, dev_device=None,
                  frame_delay=DEF_VFILE_FRAME_DELAY,
-                 vfile_fps=DEF_VFILE_FPS, loop=DEF_VFILE_LOOP):
+                 vfile_fps=DEF_VFILE_FPS, loop=DEF_VFILE_LOOP,
+                 mouse_control=False):
         super().__init__()
         self.setWindowTitle("Eye Gaze Tracker - Accessibility HID Controller")
+        
+        # Mouse control state
+        self.mouse_control_enabled = mouse_control
         
         # Compute UI scales (hierarchical: global * specific)
         self.ui_scale_global = app_settings.DEF_UI_SCALE_GLOBAL
@@ -1031,6 +1036,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Connect signals
         self.thread.started.connect(self.worker.start)
         self.worker.frameReady.connect(self.video_widget.update_frame)
+        self.worker.gazeData.connect(self.handle_gaze_data, QtCore.Qt.DirectConnection)
         self.worker.error.connect(self.on_worker_error)
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
@@ -1084,8 +1090,15 @@ class MainWindow(QtWidgets.QMainWindow):
             
             toolbar.addSeparator()
         
-        # Calibration button (always available)
-        calibrate_action = QtGui.QAction("📍 Calibrate", self)
+        # Mouse Control toggle (checkable button)
+        self.mouse_control_action = QtGui.QAction("🖱 Mouse Control", self)
+        self.mouse_control_action.setCheckable(True)
+        self.mouse_control_action.setChecked(self.mouse_control_enabled)
+        self.mouse_control_action.toggled.connect(self.toggle_mouse_control)
+        toolbar.addAction(self.mouse_control_action)
+        
+        # Calibration/Visualization button
+        calibrate_action = QtGui.QAction("📍 Calib/Viz", self)
         calibrate_action.triggered.connect(self.start_calibration)
         toolbar.addAction(calibrate_action)
         toolbar.addSeparator()
@@ -1379,6 +1392,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Connect worker gaze data to calibration window
         self.worker.gazeData.connect(self.calibration_window.update_frame_and_data)
         
+        # Also connect gaze data to our mouse handler
+        self.worker.gazeData.connect(
+            self.calibration_window.update_frame_and_data, QtCore.Qt.DirectConnection)
+        
         # Connect calibration completion/cancellation
         self.calibration_window.calibrationComplete.connect(self.on_calibration_complete)
         self.calibration_window.calibrationCancelled.connect(self.on_calibration_cancelled)
@@ -1396,6 +1413,41 @@ class MainWindow(QtWidgets.QMainWindow):
         """Handle calibration cancellation."""
         self.status.showMessage("Calibration cancelled", 2000)
         self.calibration_window = None
+
+    def toggle_mouse_control(self, enabled: bool):
+        """Toggle mouse control on/off."""
+        self.mouse_control_enabled = enabled
+        if enabled:
+            self.status.showMessage("Mouse control ENABLED - gaze will move cursor", 3000)
+        else:
+            self.status.showMessage("Mouse control disabled - visualization only", 3000)
+
+    @QtCore.Slot(np.ndarray, dict)
+    def handle_gaze_data(self, frame: np.ndarray, gaze_data: dict):
+        """Handle gaze data for mouse control."""
+        if not self.mouse_control_enabled:
+            return
+        
+        if not gaze_data or gaze_data.get('avg_gaze') is None:
+            return
+        
+        # Get screen size
+        screen = self.screen()
+        screen_w = screen.size().width()
+        screen_h = screen.size().height()
+        
+        # Map gaze to screen coordinates
+        # This is placeholder - will use calibration interpolation when available
+        avg_gaze = gaze_data['avg_gaze']
+        cx = screen_w // 2 + int(avg_gaze[0] * screen_w * 0.5)
+        cy = screen_h // 2 + int(avg_gaze[1] * screen_h * 0.5)
+        
+        # Clamp to screen bounds
+        cx = max(0, min(screen_w - 1, cx))
+        cy = max(0, min(screen_h - 1, cy))
+        
+        # Move cursor
+        mouse_control.move_cursor(cx, cy)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         # Stop worker
@@ -1462,6 +1514,11 @@ Camera Sources:
         default=DEF_VFILE_FRAME_DELAY,
         help=f"Delay between video file frames in seconds. Float. (default: {DEF_VFILE_FRAME_DELAY})"
     )
+    parser.add_argument(
+        "--mouse",
+        action="store_true",
+        help="Enable mouse control on startup (default: off, visualization only)"
+    )
     
     args = parser.parse_args()
     
@@ -1483,7 +1540,8 @@ Camera Sources:
         dev_device=args.dev,
         frame_delay=args.vfile_frame_delay,
         vfile_fps=args.vfile_fps,
-        loop=(not args.no_loop)
+        loop=(not args.no_loop),
+        mouse_control=args.mouse
     )
     win.resize(1400, 900)
     win.show()

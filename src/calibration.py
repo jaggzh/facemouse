@@ -158,6 +158,10 @@ class CalibrationWindow(QtWidgets.QWidget):
         self.remaining_points = list(self.grid_points)
         self.current_point = None
         self.current_frame = None
+        self.current_gaze_data = None
+        
+        # Computed cursor position (screen coordinates)
+        self.cursor_screen_pos = None
         
         # UI setup
         self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.FramelessWindowHint)
@@ -267,6 +271,24 @@ class CalibrationWindow(QtWidgets.QWidget):
         """Update video frame and current gaze data."""
         self.current_frame = frame
         self.current_gaze_data = gaze_data
+        
+        # Compute cursor screen position from gaze data
+        # For now, use a simple mapping - will be replaced with calibration interpolation
+        if gaze_data and gaze_data.get('avg_gaze') is not None:
+            avg_gaze = gaze_data['avg_gaze']
+            # Map gaze vector (roughly -1 to 1) to screen coordinates
+            # This is placeholder until calibration provides proper mapping
+            w, h = self.screen_size.width(), self.screen_size.height()
+            # Center of screen + gaze offset scaled to half screen
+            cx = w // 2 + int(avg_gaze[0] * w * 0.5)
+            cy = h // 2 + int(avg_gaze[1] * h * 0.5)
+            # Clamp to screen bounds
+            cx = max(0, min(w - 1, cx))
+            cy = max(0, min(h - 1, cy))
+            self.cursor_screen_pos = (cx, cy)
+        else:
+            self.cursor_screen_pos = None
+        
         self.update()
     
     @QtCore.Slot()
@@ -358,6 +380,42 @@ class CalibrationWindow(QtWidgets.QWidget):
                 color = settings.CAL_TARGET_INACTIVE
             
             self._draw_target(painter, point, color, sample_count)
+        
+        # Draw visualization cursor (gaze position indicator)
+        if self.cursor_screen_pos is not None:
+            self._draw_viz_cursor(painter, self.cursor_screen_pos)
+    
+    def _draw_viz_cursor(self, painter: QtGui.QPainter, pos: Tuple[int, int]):
+        """Draw visualization cursor showing computed gaze position."""
+        x, y = pos
+        
+        # Calculate cursor size based on screen width and scaling
+        base_size = self.screen_size.width() / 64
+        vs = int(base_size * settings.ui_scale(settings.DEF_UI_SCALE_CAL))
+        
+        # Color from settings (BGR to RGB for Qt)
+        color = QtGui.QColor(
+            settings.VIZ_CURSOR_COLOR[2],  # R
+            settings.VIZ_CURSOR_COLOR[1],  # G
+            settings.VIZ_CURSOR_COLOR[0]   # B
+        )
+        
+        pen = QtGui.QPen(color, settings.VIZ_CURSOR_LINE_THICKNESS)
+        painter.setPen(pen)
+        painter.setBrush(QtCore.Qt.NoBrush)
+        
+        # Draw crosshairs
+        # Horizontal line
+        painter.drawLine(x - vs, y, x + vs, y)
+        # Vertical line
+        painter.drawLine(x, y - vs, x, y + vs)
+        
+        # Draw outer circle
+        painter.drawEllipse(QtCore.QPoint(x, y), vs, vs)
+        
+        # Draw inner circle
+        inner_vs = (vs + 1) // 2
+        painter.drawEllipse(QtCore.QPoint(x, y), inner_vs, inner_vs)
     
     def _draw_target(self, painter: QtGui.QPainter, point: Tuple[int, int], 
                     color: Tuple[int, int, int], sample_count: int):

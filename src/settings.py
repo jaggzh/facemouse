@@ -13,6 +13,7 @@ DEF_UI_SCALE_GLOBAL = 1.0  # Applied to all UI elements
 DEF_UI_SCALE_MAIN_WINDOW = 1.0  # Additional scale for main window
 DEF_UI_SCALE_NAV_BUTTONS = 1.0  # Toolbar/navigation buttons
 DEF_UI_SCALE_CONTROL_PANEL = 0.9  # Right-side control panel (slightly smaller)
+DEF_UI_SCALE_CAL = 1.0  # Calibration/visualization window
 DEF_UI_SCALE_CAL_BUTTONS = 1.2  # Calibration Accept/Undo buttons (larger for clicking)
 
 def ui_scale(*factors) -> float:
@@ -29,6 +30,16 @@ def scaled_font_size(base_size: int, *factors) -> int:
 def scaled_size(base_size: int, *factors) -> int:
     """Get scaled widget/element size (minimum 1)."""
     return max(1, int(base_size * ui_scale(*factors)))
+
+# ============================================================================
+# Mouse Control
+# ============================================================================
+DEF_MOUSE_CONTROL_ENABLED = False  # Default off, --mouse enables
+
+# Visualization cursor (when mouse control is off, or in calibration view)
+VIZ_CURSOR_COLOR = (0xb0, 0x30, 0x90)  # BGR for 0x9030b0 (purple/magenta)
+VIZ_CURSOR_CROSSHAIR_COLOR = (0xb0, 0x30, 0x90)  # Same as cursor
+VIZ_CURSOR_LINE_THICKNESS = 1
 
 # ============================================================================
 # Calibration defaults
