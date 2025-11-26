@@ -17,7 +17,9 @@ import sys
 import time
 import math
 import argparse
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 # Suppress TensorFlow logging
 import logging
@@ -33,6 +35,8 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 import camsettingsh264 as camsettings
 import filters
+import calibration
+import settings as app_settings
 
 
 # ============================================================================
@@ -112,14 +116,18 @@ class VideoWorker(QtCore.QObject):
     """
 
     frameReady = QtCore.Signal(np.ndarray, int, int)  # frame, current_frame, total_frames
+    gazeData = QtCore.Signal(np.ndarray, dict)  # frame, gaze_data dict
     error = QtCore.Signal(str)
     finished = QtCore.Signal()
 
-    def __init__(self, video_file=None, frame_delay=DEF_VFILE_FRAME_DELAY, 
+    def __init__(self, video_file=None, usb_device=None, dev_device=None,
+                 frame_delay=DEF_VFILE_FRAME_DELAY, 
                  vfile_fps=DEF_VFILE_FPS, loop=DEF_VFILE_LOOP, parent=None):
         super().__init__(parent)
         self._running = False
         self._video_file = video_file
+        self._usb_device = usb_device
+        self._dev_device = dev_device
         self._frame_delay = frame_delay
         self._vfile_fps = vfile_fps
         self._loop = loop
@@ -253,8 +261,11 @@ class VideoWorker(QtCore.QObject):
         if self._video_file:
             # Process video file
             self._process_video_file()
+        elif self._usb_device or self._dev_device:
+            # Process USB/V4L2 camera
+            self._process_usb_camera()
         else:
-            # Process camera stream
+            # Process TCP camera stream
             self._process_camera_stream()
 
         self.finished.emit()
@@ -322,13 +333,18 @@ class VideoWorker(QtCore.QObject):
                     img = self._apply_image_adjustments(img)
 
                     # Run Mediapipe and draw overlays
+                    gaze_data = None
                     try:
-                        img = self._process_and_overlay(img)
+                        img, gaze_data = self._process_and_overlay(img)
                     except Exception as e:
                         self.error.emit(f"Processing error: {e}")
 
                     # Emit the annotated frame with frame info
                     self.frameReady.emit(img, current_frame_idx + 1, total_frames)
+                    
+                    # Emit gaze data for calibration
+                    if gaze_data is not None:
+                        self.gazeData.emit(img, gaze_data)
 
                     # Advance to next frame
                     current_frame_idx += 1
@@ -358,6 +374,130 @@ class VideoWorker(QtCore.QObject):
             # Exit loop (unless looping)
             if not self._loop:
                 break
+
+    def _process_usb_camera(self):
+        """Process USB/V4L2 camera device."""
+        # Determine device path
+        if self._dev_device:
+            device = self._dev_device
+        elif self._usb_device:
+            # Try to find device by USB identifier
+            device = self._find_device_by_usb_id(self._usb_device)
+            if device is None:
+                msg = f"Could not find device matching USB identifier: {self._usb_device}"
+                print("[Worker]", msg)
+                self.error.emit(msg)
+                return
+        else:
+            return
+        
+        print(f"[Worker] Opening USB camera: {device}")
+        
+        while self._running:
+            try:
+                # Open with OpenCV (simpler for V4L2 devices)
+                cap = cv2.VideoCapture(device)
+                
+                if not cap.isOpened():
+                    msg = f"Failed to open camera device: {device}"
+                    print("[Worker]", msg)
+                    self.error.emit(msg)
+                    time.sleep(1.0)
+                    continue
+                
+                print(f"[Worker] Camera opened: {device}")
+                
+                frame_count = 0
+                while self._running:
+                    ret, img = cap.read()
+                    
+                    if not ret:
+                        print("[Worker] Failed to read frame from camera")
+                        break
+                    
+                    # Apply brightness/contrast adjustments
+                    img = self._apply_image_adjustments(img)
+                    
+                    # Run Mediapipe and draw overlays
+                    gaze_data = None
+                    try:
+                        img, gaze_data = self._process_and_overlay(img)
+                    except Exception as e:
+                        self.error.emit(f"Processing error: {e}")
+                    
+                    # Emit the annotated frame
+                    frame_count += 1
+                    self.frameReady.emit(img, frame_count, -1)
+                    
+                    # Emit gaze data for calibration
+                    if gaze_data is not None:
+                        self.gazeData.emit(img, gaze_data)
+                
+            except Exception as e:
+                msg = f"Camera error: {e}"
+                print("[Worker]", msg)
+                self.error.emit(msg)
+            
+            finally:
+                if 'cap' in locals():
+                    cap.release()
+            
+            # If still running, try to reconnect
+            if self._running:
+                print("[Worker] Will attempt to reconnect in 1s")
+                time.sleep(1.0)
+    
+    def _find_device_by_usb_id(self, usb_id: str) -> Optional[str]:
+        """Find /dev/videoN device by USB identifier using v4l2-ctl."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['v4l2-ctl', '--list-devices'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode != 0:
+                print("[Worker] v4l2-ctl failed, trying direct match")
+                # Fallback: try common device numbers
+                for i in range(10):
+                    dev = f"/dev/video{i}"
+                    if Path(dev).exists():
+                        # Try to match USB ID in device path
+                        try:
+                            realpath = Path(dev).resolve()
+                            if usb_id in str(realpath):
+                                return dev
+                        except:
+                            pass
+                return None
+            
+            # Parse v4l2-ctl output
+            lines = result.stdout.split('\n')
+            current_device_name = None
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Device name lines don't start with /dev/
+                if not line.startswith('/dev/'):
+                    current_device_name = line.rstrip(':')
+                else:
+                    # This is a device path
+                    if current_device_name and usb_id in current_device_name:
+                        # Found a match
+                        device_path = line.strip()
+                        print(f"[Worker] Found USB device: {current_device_name} -> {device_path}")
+                        return device_path
+            
+            return None
+            
+        except Exception as e:
+            print(f"[Worker] Error finding USB device: {e}")
+            return None
 
     def _process_camera_stream(self):
         """Process live camera stream."""
@@ -399,14 +539,19 @@ class VideoWorker(QtCore.QObject):
                     img = self._apply_image_adjustments(img)
 
                     # Run Mediapipe and draw overlays
+                    gaze_data = None
                     try:
-                        img = self._process_and_overlay(img)
+                        img, gaze_data = self._process_and_overlay(img)
                     except Exception as e:
                         self.error.emit(f"Processing error: {e}")
 
                     # Emit the annotated frame (no frame count for streams)
                     frame_count += 1
                     self.frameReady.emit(img, frame_count, -1)
+                    
+                    # Emit gaze data for calibration
+                    if gaze_data is not None:
+                        self.gazeData.emit(img, gaze_data)
 
             except Exception as e:
                 msg = f"Decode error or stream ended: {e}"
@@ -722,7 +867,19 @@ class VideoWorker(QtCore.QObject):
             # Blend this overlay update
             img = cv2.addWeighted(overlay, ALPHA_LANDMARKS, img, 1.0 - ALPHA_LANDMARKS, 0)
 
-        return img
+        # Package gaze data for calibration/logging
+        gaze_data = {
+            'timestamp': datetime.now().isoformat(),
+            'left_gaze': left["dir_norm"].tolist() if left_open else None,
+            'right_gaze': right["dir_norm"].tolist() if right_open else None,
+            'avg_gaze': avg_dir.tolist() if open_dirs else None,
+            'face_aim': face_dir.tolist(),
+            'left_open': left_open,
+            'right_open': right_open,
+            'landmarks': {idx: [p.x, p.y, p.z] for idx, p in enumerate(face_landmarks.landmark)}
+        }
+
+        return img, gaze_data
 
 
 class VideoWidget(QtWidgets.QWidget):
@@ -822,7 +979,8 @@ class ColorLegendWidget(QtWidgets.QWidget):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, video_file=None, frame_delay=DEF_VFILE_FRAME_DELAY,
+    def __init__(self, video_file=None, usb_device=None, dev_device=None,
+                 frame_delay=DEF_VFILE_FRAME_DELAY,
                  vfile_fps=DEF_VFILE_FPS, loop=DEF_VFILE_LOOP):
         super().__init__()
         self.setWindowTitle("Eye Gaze Tracker - Accessibility HID Controller")
@@ -835,6 +993,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thread = QtCore.QThread(self)
         self.worker = VideoWorker(
             video_file=video_file,
+            usb_device=usb_device,
+            dev_device=dev_device,
             frame_delay=frame_delay,
             vfile_fps=vfile_fps,
             loop=loop
@@ -843,6 +1003,9 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Store video file flag
         self.is_video_file = video_file is not None
+        
+        # Calibration window
+        self.calibration_window = None
 
         # Toolbar (needs worker to exist for signal connections)
         self._create_toolbar(self.is_video_file)
@@ -853,8 +1016,12 @@ class MainWindow(QtWidgets.QMainWindow):
             mode_str = "looping" if loop else "single-pass"
             fps_str = f"{vfile_fps} fps" if vfile_fps else f"{frame_delay}s/frame"
             self.status.showMessage(f"Video file ({mode_str}, {fps_str}): {video_file}")
+        elif usb_device:
+            self.status.showMessage(f"USB camera: {usb_device}")
+        elif dev_device:
+            self.status.showMessage(f"Camera device: {dev_device}")
         else:
-            self.status.showMessage("Connecting to camera...")
+            self.status.showMessage("Connecting to TCP camera...")
 
         # Connect signals
         self.thread.started.connect(self.worker.start)
@@ -904,6 +1071,12 @@ class MainWindow(QtWidgets.QMainWindow):
             toolbar.addAction(jump_end_action)
             
             toolbar.addSeparator()
+        
+        # Calibration button (always available)
+        calibrate_action = QtGui.QAction("📍 Calibrate", self)
+        calibrate_action.triggered.connect(self.start_calibration)
+        toolbar.addAction(calibrate_action)
+        toolbar.addSeparator()
         
         # Exit
         exit_action = QtGui.QAction("Exit", self)
@@ -1172,6 +1345,39 @@ class MainWindow(QtWidgets.QMainWindow):
         print(f"[UI] Would save config: {config}")
         self.status.showMessage("Settings saved (not yet implemented)", 2000)
 
+    def start_calibration(self):
+        """Start calibration process."""
+        if self.calibration_window is not None:
+            return  # Already calibrating
+        
+        # Create calibration window
+        screen_size = self.screen().size()
+        self.calibration_window = calibration.CalibrationWindow(
+            screen_size=screen_size,
+            grid_size=app_settings.DEF_CAL_GRID_SIZE
+        )
+        
+        # Connect worker gaze data to calibration window
+        self.worker.gazeData.connect(self.calibration_window.update_frame_and_data)
+        
+        # Connect calibration completion/cancellation
+        self.calibration_window.calibrationComplete.connect(self.on_calibration_complete)
+        self.calibration_window.calibrationCancelled.connect(self.on_calibration_cancelled)
+        
+        # Show calibration window
+        self.calibration_window.showFullScreen()
+        self.status.showMessage("Calibration in progress...")
+    
+    def on_calibration_complete(self, cal_data: calibration.CalibrationData):
+        """Handle calibration completion."""
+        self.status.showMessage(f"Calibration complete: {cal_data.name}", 5000)
+        self.calibration_window = None
+    
+    def on_calibration_cancelled(self):
+        """Handle calibration cancellation."""
+        self.status.showMessage("Calibration cancelled", 2000)
+        self.calibration_window = None
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         # Stop worker
         if hasattr(self, 'worker') and self.worker is not None:
@@ -1196,12 +1402,28 @@ Video File Controls:
   ←/→       Step backward/forward one frame
   Home/End  Jump to start/end of video
   Q         Quit application
+  
+Camera Sources:
+  Default: TCP stream from camsettingsh264.py (camhost:camport)
+  --usb: USB camera by identifier (from v4l2-ctl --list-devices)
+  --dev: Direct device path (e.g., /dev/video0)
+  -f/--file: Video file for testing
         """
     )
     parser.add_argument(
         "-f", "--file",
         type=str,
         help="Path to video file for testing (instead of live camera stream)"
+    )
+    parser.add_argument(
+        "--usb",
+        type=str,
+        help="USB camera identifier (e.g., 'usb-0000:1a:00.0'). Lists devices with v4l2-ctl --list-devices"
+    )
+    parser.add_argument(
+        "--dev",
+        type=str,
+        help="Direct device path (e.g., /dev/video0, /dev/video2)"
     )
     parser.add_argument(
         "--no-loop",
@@ -1224,9 +1446,22 @@ Video File Controls:
     
     args = parser.parse_args()
     
+    # Validate camera source options (only one should be specified)
+    camera_sources = sum([
+        args.file is not None,
+        args.usb is not None,
+        args.dev is not None
+    ])
+    
+    if camera_sources > 1:
+        print("Error: Only one camera source can be specified (--file, --usb, or --dev)")
+        sys.exit(1)
+    
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow(
         video_file=args.file,
+        usb_device=args.usb,
+        dev_device=args.dev,
         frame_delay=args.vfile_frame_delay,
         vfile_fps=args.vfile_fps,
         loop=(not args.no_loop)
