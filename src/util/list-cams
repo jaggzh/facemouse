@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""
+List available camera devices for use with --usb or --dev options.
+
+This script helps identify USB cameras and their device paths.
+"""
+
+import subprocess
+import sys
+from pathlib import Path
+
+def list_v4l2_devices():
+    """List devices using v4l2-ctl."""
+    try:
+        result = subprocess.run(
+            ['v4l2-ctl', '--list-devices'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        if result.returncode != 0:
+            print("Error: v4l2-ctl failed. Is v4l-utils installed?")
+            print("Install with: sudo apt-get install v4l-utils")
+            return False
+        
+        print("=" * 70)
+        print("Available Camera Devices (from v4l2-ctl --list-devices)")
+        print("=" * 70)
+        print(result.stdout)
+        
+        # Parse and provide usage examples
+        lines = result.stdout.split('\n')
+        current_device_name = None
+        devices = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            if not line.startswith('/dev/'):
+                current_device_name = line.rstrip(':')
+            else:
+                device_path = line.strip()
+                if current_device_name:
+                    devices.append((current_device_name, device_path))
+        
+        if devices:
+            print("\n" + "=" * 70)
+            print("Usage Examples:")
+            print("=" * 70)
+            for name, path in devices:
+                print(f"\n# Use device: {name}")
+                print(f"  Direct path:")
+                print(f"    ./gaze_pyside_app.py --dev {path}")
+                
+                # Try to extract USB identifier
+                if 'usb' in name.lower():
+                    # Look for usb-xxxx pattern
+                    parts = name.split()
+                    for part in parts:
+                        if part.startswith('usb-'):
+                            usb_id = part.rstrip(':')
+                            print(f"  USB identifier:")
+                            print(f"    ./gaze_pyside_app.py --usb {usb_id}")
+                            break
+        
+        return True
+        
+    except FileNotFoundError:
+        print("Error: v4l2-ctl not found. Is v4l-utils installed?")
+        print("Install with: sudo apt-get install v4l-utils")
+        return False
+    except Exception as e:
+        print(f"Error: {e}")
+        return False
+
+
+def list_dev_video_devices():
+    """List /dev/video* devices directly."""
+    print("\n" + "=" * 70)
+    print("Direct Device Paths:")
+    print("=" * 70)
+    
+    devices = sorted(Path('/dev').glob('video*'))
+    
+    if not devices:
+        print("No /dev/video* devices found")
+        return
+    
+    for device in devices:
+        # Check if it's a real device (not a link or metadata device)
+        try:
+            realpath = device.resolve()
+            print(f"\n{device}")
+            print(f"  -> {realpath}")
+            
+            # Try to get basic info
+            try:
+                result = subprocess.run(
+                    ['v4l2-ctl', '--device', str(device), '--info'],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if result.returncode == 0:
+                    # Extract card name
+                    for line in result.stdout.split('\n'):
+                        if 'Card type' in line:
+                            print(f"  {line.strip()}")
+            except:
+                pass
+                
+        except Exception as e:
+            print(f"{device}: {e}")
+
+
+def main():
+    print("Camera Device Finder")
+    print("=" * 70)
+    print()
+    
+    # Try v4l2-ctl first (most informative)
+    if not list_v4l2_devices():
+        # Fallback to direct listing
+        list_dev_video_devices()
+    
+    print("\n" + "=" * 70)
+    print("Note: Some cameras may have multiple device entries.")
+    print("Try each one to find which works best.")
+    print("=" * 70)
+
+
+if __name__ == '__main__':
+    main()
