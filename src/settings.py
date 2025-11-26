@@ -6,6 +6,31 @@ Global settings and defaults for the gaze tracker.
 from pathlib import Path
 
 # ============================================================================
+# UI Scaling
+# ============================================================================
+# Hierarchical: global -> main_window -> { nav_buttons, control_panel }
+DEF_UI_SCALE_GLOBAL = 1.0  # Applied to all UI elements
+DEF_UI_SCALE_MAIN_WINDOW = 1.0  # Additional scale for main window
+DEF_UI_SCALE_NAV_BUTTONS = 1.0  # Toolbar/navigation buttons
+DEF_UI_SCALE_CONTROL_PANEL = 0.9  # Right-side control panel (slightly smaller)
+DEF_UI_SCALE_CAL_BUTTONS = 1.2  # Calibration Accept/Undo buttons (larger for clicking)
+
+def ui_scale(*factors) -> float:
+    """Compute effective scale from hierarchical factors."""
+    result = DEF_UI_SCALE_GLOBAL
+    for f in factors:
+        result *= f
+    return result
+
+def scaled_font_size(base_size: int, *factors) -> int:
+    """Get scaled font size (minimum 6pt)."""
+    return max(6, int(base_size * ui_scale(*factors)))
+
+def scaled_size(base_size: int, *factors) -> int:
+    """Get scaled widget/element size (minimum 1)."""
+    return max(1, int(base_size * ui_scale(*factors)))
+
+# ============================================================================
 # Calibration defaults
 # ============================================================================
 

@@ -162,7 +162,8 @@ class CalibrationWindow(QtWidgets.QWidget):
         # UI setup
         self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.FramelessWindowHint)
         self.setGeometry(0, 0, screen_size.width(), screen_size.height())
-        self.setCursor(QtCore.Qt.BlankCursor)
+        # Keep cursor visible for assistant to click buttons
+        self.setCursor(QtCore.Qt.ArrowCursor)
         
         # Create controls
         self._create_controls()
@@ -192,16 +193,28 @@ class CalibrationWindow(QtWidgets.QWidget):
         self.button_widget = QtWidgets.QWidget(self)
         button_layout = QtWidgets.QHBoxLayout(self.button_widget)
         
+        # Apply calibration button scaling
+        btn_font_size = settings.scaled_font_size(12, settings.DEF_UI_SCALE_CAL_BUTTONS)
+        btn_font = QtGui.QFont()
+        btn_font.setPointSize(btn_font_size)
+        btn_font.setBold(True)
+        
+        btn_min_w = settings.scaled_size(150, settings.DEF_UI_SCALE_CAL_BUTTONS)
+        btn_min_h = settings.scaled_size(50, settings.DEF_UI_SCALE_CAL_BUTTONS)
+        
         self.accept_btn = QtWidgets.QPushButton("Accept Point (A)")
-        self.accept_btn.setMinimumSize(150, 50)
+        self.accept_btn.setFont(btn_font)
+        self.accept_btn.setMinimumSize(btn_min_w, btn_min_h)
         self.accept_btn.clicked.connect(self.accept_point)
         
         self.undo_btn = QtWidgets.QPushButton("Undo Last (U)")
-        self.undo_btn.setMinimumSize(150, 50)
+        self.undo_btn.setFont(btn_font)
+        self.undo_btn.setMinimumSize(btn_min_w, btn_min_h)
         self.undo_btn.clicked.connect(self.undo_point)
         
         self.cancel_btn = QtWidgets.QPushButton("Cancel (Esc)")
-        self.cancel_btn.setMinimumSize(150, 50)
+        self.cancel_btn.setFont(btn_font)
+        self.cancel_btn.setMinimumSize(btn_min_w, btn_min_h)
         self.cancel_btn.clicked.connect(self.cancel_calibration)
         
         button_layout.addWidget(self.accept_btn)
@@ -216,25 +229,21 @@ class CalibrationWindow(QtWidgets.QWidget):
         )
     
     def _next_point(self):
-        """Select and display next calibration point."""
+        """Select and display next calibration point (sequential for MVP)."""
         if not self.remaining_points:
             # Calibration complete
             self._complete_calibration()
             return
         
-        if self.current_point is None:
-            # First point - random choice
-            self.current_point = random.choice(self.remaining_points)
-        else:
-            # Use distant_with_noise algorithm
-            self.current_point = distant_with_noise(self.current_point, self.remaining_points)
+        # Sequential order for simplicity (start corner, work through grid)
+        self.current_point = self.remaining_points.pop(0)
         
-        self.remaining_points.remove(self.current_point)
         self.update()
         
         # TTS direction hint
         direction = self._get_direction_text(self.current_point)
         tts(settings.CAL_TTS_MESSAGES['point'].format(direction=direction))
+        print(f"[Calibration] Next point: {self.current_point} ({direction})")
     
     def _get_direction_text(self, point: Tuple[int, int]) -> str:
         """Get human-readable direction for a point."""
@@ -262,22 +271,18 @@ class CalibrationWindow(QtWidgets.QWidget):
     
     @QtCore.Slot()
     def accept_point(self):
-        """Accept current calibration point."""
+        """Accept current calibration point and move to next."""
         if self.current_point is None:
             return
         
-        # Collect sample (will be provided by main app via signal)
+        # Collect sample
         if hasattr(self, 'current_gaze_data'):
             self.cal_data.add_sample(self.current_point, self.current_gaze_data)
             tts(settings.CAL_TTS_MESSAGES['accepted'])
+            print(f"[Calibration] Accepted point {self.current_point}, samples: {self.cal_data.get_sample_count(self.current_point)}")
         
-        # Check if we have enough samples
-        if self.cal_data.get_sample_count(self.current_point) >= settings.DEF_CAL_SAMPLES:
-            # Move to next point
-            self._next_point()
-        else:
-            # Need more samples for this point
-            self.update()
+        # Move to next point immediately
+        self._next_point()
     
     @QtCore.Slot()
     def undo_point(self):

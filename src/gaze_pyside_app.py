@@ -984,6 +984,11 @@ class MainWindow(QtWidgets.QMainWindow):
                  vfile_fps=DEF_VFILE_FPS, loop=DEF_VFILE_LOOP):
         super().__init__()
         self.setWindowTitle("Eye Gaze Tracker - Accessibility HID Controller")
+        
+        # Compute UI scales (hierarchical: global * specific)
+        self.ui_scale_global = app_settings.DEF_UI_SCALE_GLOBAL
+        self.ui_scale_nav = self.ui_scale_global * app_settings.DEF_UI_SCALE_MAIN_WINDOW * app_settings.DEF_UI_SCALE_NAV_BUTTONS
+        self.ui_scale_panel = self.ui_scale_global * app_settings.DEF_UI_SCALE_MAIN_WINDOW * app_settings.DEF_UI_SCALE_CONTROL_PANEL
 
         # Central video widget
         self.video_widget = VideoWidget(self)
@@ -1041,6 +1046,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _create_toolbar(self, is_video_file):
         toolbar = self.addToolBar("Main")
+        
+        # Apply nav button scaling
+        nav_font_size = app_settings.scaled_font_size(10, app_settings.DEF_UI_SCALE_MAIN_WINDOW, 
+                                                       app_settings.DEF_UI_SCALE_NAV_BUTTONS)
+        toolbar_font = QtGui.QFont()
+        toolbar_font.setPointSize(nav_font_size)
+        toolbar.setFont(toolbar_font)
         
         # Video controls (only for file playback)
         if is_video_file:
@@ -1120,6 +1132,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         widget = QtWidgets.QWidget(dock)
         layout = QtWidgets.QVBoxLayout(widget)
+        
+        # Apply control panel scaling
+        cp_font_size = app_settings.scaled_font_size(9, app_settings.DEF_UI_SCALE_MAIN_WINDOW,
+                                                      app_settings.DEF_UI_SCALE_CONTROL_PANEL)
+        cp_font = QtGui.QFont()
+        cp_font.setPointSize(cp_font_size)
+        widget.setFont(cp_font)
         
         # Image adjustments group
         img_group = QtWidgets.QGroupBox("Image Adjustments")
