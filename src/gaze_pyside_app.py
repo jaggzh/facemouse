@@ -19,7 +19,7 @@ import math
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 # Suppress TensorFlow logging
 import logging
@@ -990,6 +990,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Mouse control state
         self.mouse_control_enabled = mouse_control
         
+        # Active calibration preset
+        self.active_preset = None
+        self.preset_actions = []  # Toolbar preset buttons
+        
         # Compute UI scales (hierarchical: global * specific)
         self.ui_scale_global = app_settings.DEF_UI_SCALE_GLOBAL
         self.ui_scale_nav = self.ui_scale_global * app_settings.DEF_UI_SCALE_MAIN_WINDOW * app_settings.DEF_UI_SCALE_NAV_BUTTONS
@@ -1051,14 +1055,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.thread.start()
 
     def _create_toolbar(self, is_video_file):
-        toolbar = self.addToolBar("Main")
+        self.toolbar = self.addToolBar("Main")
         
         # Apply nav button scaling
         nav_font_size = app_settings.scaled_font_size(10, app_settings.DEF_UI_SCALE_MAIN_WINDOW, 
                                                        app_settings.DEF_UI_SCALE_NAV_BUTTONS)
         toolbar_font = QtGui.QFont()
         toolbar_font.setPointSize(nav_font_size)
-        toolbar.setFont(toolbar_font)
+        self.toolbar.setFont(toolbar_font)
         
         # Video controls (only for file playback)
         if is_video_file:
@@ -1070,43 +1074,56 @@ class MainWindow(QtWidgets.QMainWindow):
             
             play_pause_action = QtGui.QAction("⏯ Pause/Play", self)
             play_pause_action.triggered.connect(make_handler("Play/Pause clicked", self.worker.toggle_pause))
-            toolbar.addAction(play_pause_action)
+            self.toolbar.addAction(play_pause_action)
             
             step_back_action = QtGui.QAction("⏮ Step Back", self)
             step_back_action.triggered.connect(make_handler("Step Back clicked", self.worker.step_backward))
-            toolbar.addAction(step_back_action)
+            self.toolbar.addAction(step_back_action)
             
             step_fwd_action = QtGui.QAction("⏭ Step Fwd", self)
             step_fwd_action.triggered.connect(make_handler("Step Forward clicked", self.worker.step_forward))
-            toolbar.addAction(step_fwd_action)
+            self.toolbar.addAction(step_fwd_action)
             
             jump_start_action = QtGui.QAction("⏪ Start", self)
             jump_start_action.triggered.connect(make_handler("Jump Start clicked", self.worker.jump_to_start))
-            toolbar.addAction(jump_start_action)
+            self.toolbar.addAction(jump_start_action)
             
             jump_end_action = QtGui.QAction("⏩ End", self)
             jump_end_action.triggered.connect(make_handler("Jump End clicked", self.worker.jump_to_end))
-            toolbar.addAction(jump_end_action)
+            self.toolbar.addAction(jump_end_action)
             
-            toolbar.addSeparator()
+            self.toolbar.addSeparator()
         
         # Mouse Control toggle (checkable button)
         self.mouse_control_action = QtGui.QAction("🖱 Mouse Control", self)
         self.mouse_control_action.setCheckable(True)
         self.mouse_control_action.setChecked(self.mouse_control_enabled)
         self.mouse_control_action.toggled.connect(self.toggle_mouse_control)
-        toolbar.addAction(self.mouse_control_action)
+        self.toolbar.addAction(self.mouse_control_action)
         
         # Calibration/Visualization button
         calibrate_action = QtGui.QAction("📍 Calib/Viz", self)
         calibrate_action.triggered.connect(self.start_calibration)
-        toolbar.addAction(calibrate_action)
-        toolbar.addSeparator()
+        self.toolbar.addAction(calibrate_action)
+        self.toolbar.addSeparator()
         
         # Exit
         exit_action = QtGui.QAction("Exit", self)
         exit_action.triggered.connect(self.close)
-        toolbar.addAction(exit_action)
+        self.toolbar.addAction(exit_action)
+        
+        self.toolbar.addSeparator()
+        
+        # Presets Manager button
+        presets_action = QtGui.QAction("📂 Presets", self)
+        presets_action.triggered.connect(self.open_presets_manager)
+        self.toolbar.addAction(presets_action)
+        
+        # Separator before favorite presets
+        self.presets_separator = self.toolbar.addSeparator()
+        
+        # Add favorite presets as buttons
+        self._refresh_preset_buttons()
 
     def _setup_shortcuts(self):
         """Setup global keyboard shortcuts that work regardless of focus."""
@@ -1386,13 +1403,11 @@ class MainWindow(QtWidgets.QMainWindow):
         screen_size = self.screen().size()
         self.calibration_window = calibration.CalibrationWindow(
             screen_size=screen_size,
-            grid_size=app_settings.DEF_CAL_GRID_SIZE
+            grid_size=app_settings.DEF_CAL_GRID_SIZE,
+            active_preset=self.active_preset
         )
         
-        # Connect worker gaze data to calibration window
-        self.worker.gazeData.connect(self.calibration_window.update_frame_and_data)
-        
-        # Also connect gaze data to our mouse handler
+        # Connect worker gaze data to calibration window (DirectConnection for responsiveness)
         self.worker.gazeData.connect(
             self.calibration_window.update_frame_and_data, QtCore.Qt.DirectConnection)
         
@@ -1408,11 +1423,60 @@ class MainWindow(QtWidgets.QMainWindow):
         """Handle calibration completion."""
         self.status.showMessage(f"Calibration complete: {cal_data.name}", 5000)
         self.calibration_window = None
+        
+        # Auto-select the new preset
+        self.active_preset = cal_data
+        self.status.showMessage(f"Active preset: {cal_data.name}", 3000)
+        
+        # Refresh favorite buttons
+        self._refresh_preset_buttons()
     
     def on_calibration_cancelled(self):
         """Handle calibration cancellation."""
         self.status.showMessage("Calibration cancelled", 2000)
         self.calibration_window = None
+
+    def open_presets_manager(self):
+        """Open the presets manager dialog."""
+        dialog = calibration.PresetsManagerDialog(self)
+        dialog.presetSelected.connect(self.select_preset)
+        dialog.exec()
+        
+        # Refresh favorite buttons after manager closes
+        self._refresh_preset_buttons()
+    
+    def select_preset(self, preset: calibration.CalibrationData):
+        """Select and activate a preset."""
+        self.active_preset = preset
+        self.status.showMessage(f"Active preset: {preset.name}", 3000)
+    
+    def _refresh_preset_buttons(self):
+        """Refresh favorite preset buttons in toolbar."""
+        # Remove old preset actions
+        for action in self.preset_actions:
+            self.toolbar.removeAction(action)
+        self.preset_actions.clear()
+        
+        # Add favorite presets as buttons
+        favorites = calibration.CalibrationData.get_favorites()
+        print(f"[UI] Refreshing preset buttons, found {len(favorites)} favorites")
+        
+        for preset in favorites:
+            action = QtGui.QAction(f"⭐ {preset.name}", self)
+            
+            # Tooltip with descriptions
+            tooltip = f"<b>{preset.name}</b>"
+            if preset.camera_description:
+                tooltip += f"<br>Camera: {preset.camera_description}"
+            if preset.display_description:
+                tooltip += f"<br>Display: {preset.display_description}"
+            action.setToolTip(tooltip)
+            
+            # Capture preset in lambda properly
+            action.triggered.connect(lambda checked, p=preset: self.select_preset(p))
+            
+            self.toolbar.addAction(action)
+            self.preset_actions.append(action)
 
     def toggle_mouse_control(self, enabled: bool):
         """Toggle mouse control on/off."""
@@ -1437,10 +1501,15 @@ class MainWindow(QtWidgets.QMainWindow):
         screen_h = screen.size().height()
         
         # Map gaze to screen coordinates
-        # This is placeholder - will use calibration interpolation when available
-        avg_gaze = gaze_data['avg_gaze']
-        cx = screen_w // 2 + int(avg_gaze[0] * screen_w * 0.5)
-        cy = screen_h // 2 + int(avg_gaze[1] * screen_h * 0.5)
+        if self.active_preset:
+            # Use calibration data for mapping
+            cx, cy = self._map_gaze_with_calibration(gaze_data, screen_w, screen_h)
+        else:
+            # Fallback: simple mapping (will be inaccurate)
+            avg_gaze = gaze_data['avg_gaze']
+            # Flip horizontal (gaze left = screen left, which means negative -> left side)
+            cx = screen_w // 2 - int(avg_gaze[0] * screen_w * 0.5)
+            cy = screen_h // 2 + int(avg_gaze[1] * screen_h * 0.5)
         
         # Clamp to screen bounds
         cx = max(0, min(screen_w - 1, cx))
@@ -1448,6 +1517,58 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Move cursor
         mouse_control.move_cursor(cx, cy)
+    
+    def _map_gaze_with_calibration(self, gaze_data: dict, screen_w: int, screen_h: int) -> Tuple[int, int]:
+        """Map gaze data to screen coordinates using calibration preset."""
+        if not self.active_preset:
+            return screen_w // 2, screen_h // 2
+        
+        avg_gaze = gaze_data.get('avg_gaze')
+        if avg_gaze is None:
+            return screen_w // 2, screen_h // 2
+        
+        # Get averaged calibration data
+        cal_points = self.active_preset.get_averaged_data()
+        
+        if not cal_points:
+            # No calibration data, use fallback
+            return screen_w // 2 - int(avg_gaze[0] * screen_w * 0.5), \
+                   screen_h // 2 + int(avg_gaze[1] * screen_h * 0.5)
+        
+        # Simple nearest-neighbor interpolation for now
+        # TODO: Implement proper polynomial interpolation
+        gaze_x, gaze_y = avg_gaze[0], avg_gaze[1]
+        
+        # Find closest calibration points and interpolate
+        # For now, use inverse distance weighting
+        total_weight = 0.0
+        weighted_x = 0.0
+        weighted_y = 0.0
+        
+        for (screen_x, screen_y), data in cal_points.items():
+            if data.get('avg_gaze') is None:
+                continue
+            
+            cal_gaze = data['avg_gaze']
+            
+            # Distance in gaze space
+            dist = np.sqrt((gaze_x - cal_gaze[0])**2 + (gaze_y - cal_gaze[1])**2)
+            
+            if dist < 0.001:
+                # Very close - just use this point
+                return screen_x, screen_y
+            
+            # Inverse distance weight
+            weight = 1.0 / (dist ** 2)
+            total_weight += weight
+            weighted_x += screen_x * weight
+            weighted_y += screen_y * weight
+        
+        if total_weight > 0:
+            return int(weighted_x / total_weight), int(weighted_y / total_weight)
+        else:
+            # Fallback
+            return screen_w // 2, screen_h // 2
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         # Stop worker
@@ -1494,7 +1615,7 @@ Camera Sources:
     parser.add_argument(
         "--dev",
         type=str,
-        help="Direct device path (e.g., /dev/video0, /dev/video2)"
+        help="Direct device path (e.g., /dev/video0 or just '0' for /dev/video0)"
     )
     parser.add_argument(
         "--no-loop",
@@ -1533,11 +1654,16 @@ Camera Sources:
         print("Error: Only one camera source can be specified (--file, --usb, or --dev)")
         sys.exit(1)
     
+    # Process --dev shorthand (e.g., "0" -> "/dev/video0")
+    dev_device = args.dev
+    if dev_device and dev_device.isdigit():
+        dev_device = f"/dev/video{dev_device}"
+    
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow(
         video_file=args.file,
         usb_device=args.usb,
-        dev_device=args.dev,
+        dev_device=dev_device,
         frame_delay=args.vfile_frame_delay,
         vfile_fps=args.vfile_fps,
         loop=(not args.no_loop),
