@@ -71,10 +71,14 @@ DEF_LM_SPECIAL_BRIGHTNESS = 0.7  # 70% brightness for special landmarks
 COLOR_LM_ALL = (64, 64, 255)
 
 # Gaze vectors
-COLOR_GAZE_LEFT = (0, 255, 0)
-COLOR_GAZE_RIGHT = (0, 200, 255)
+COLOR_GAZE_LEFT = (0, 255, 0)  # Green
+COLOR_GAZE_RIGHT = (0, 200, 255)  # Yellow
 COLOR_GAZE_AVG = (255, 255, 0)
 COLOR_FACE_AIM = (255, 0, 255)
+
+# Eyelid colors (swapped from iris for distinction)
+COLOR_EYELID_LEFT = COLOR_GAZE_RIGHT  # Left eye lids = yellow (right iris color)
+COLOR_EYELID_RIGHT = COLOR_GAZE_LEFT  # Right eye lids = green (left iris color)
 
 # Opacity for landmark overlay (0..1)
 ALPHA_LANDMARKS = 0.5
@@ -618,6 +622,9 @@ class VideoWorker(QtCore.QObject):
         """Run Mediapipe, compute simple per-eye gaze offsets, detect blinks
         via eye openness ratio, and draw debug overlays.
         """
+        # Mirror flip horizontally for natural mirror-like view
+        img = cv2.flip(img, 1)
+        
         h, w, _ = img.shape
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(rgb)
@@ -735,33 +742,33 @@ class VideoWorker(QtCore.QObject):
                 bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
                 return tuple(int(x) for x in bgr[0, 0])
             
-            def draw_used(info, vector_color):
+            def draw_used(info, vector_color, eyelid_color):
                 # Iris + pupil: darker version of gaze color
                 iris_color = darken_color(vector_color, 0.7)
                 for idx in list(info["iris_idx"]) + [info["pupil_idx"]]:
-                    p = face_landmarks.landmark[idx]
-                    x = int(p.x * w)
-                    y = int(p.y * h)
+                    filt = lm(idx)  # Use FILTERED position
+                    x = int(filt[0] * w)
+                    y = int(filt[1] * h)
                     cv2.circle(overlay, (x, y), lm_special_size, iris_color, -1)
                 
                 # Corners: darker + hue shifted for distinctiveness
                 corner_color = shift_hue_bgr(darken_color(vector_color, 0.6), 40)
                 for idx in info["corners_idx"]:
-                    p = face_landmarks.landmark[idx]
-                    x = int(p.x * w)
-                    y = int(p.y * h)
+                    filt = lm(idx)  # Use FILTERED position
+                    x = int(filt[0] * w)
+                    y = int(filt[1] * h)
                     cv2.circle(overlay, (x, y), lm_special_size, corner_color, -1)
                 
-                # Lids: similar to iris
-                lid_color = darken_color(vector_color, 0.65)
+                # Lids: use dedicated eyelid color (swapped from opposite eye)
+                lid_color = darken_color(eyelid_color, 0.65)
                 for idx in info["lids_idx"]:
-                    p = face_landmarks.landmark[idx]
-                    x = int(p.x * w)
-                    y = int(p.y * h)
+                    filt = lm(idx)  # Use FILTERED position
+                    x = int(filt[0] * w)
+                    y = int(filt[1] * h)
                     cv2.circle(overlay, (x, y), lm_special_size, lid_color, -1)
 
-            draw_used(left, COLOR_GAZE_LEFT)
-            draw_used(right, COLOR_GAZE_RIGHT)
+            draw_used(left, COLOR_GAZE_LEFT, COLOR_EYELID_LEFT)
+            draw_used(right, COLOR_GAZE_RIGHT, COLOR_EYELID_RIGHT)
 
         # Blend overlay back onto image for landmarks
         img = cv2.addWeighted(overlay, ALPHA_LANDMARKS, img, 1.0 - ALPHA_LANDMARKS, 0)
@@ -787,7 +794,8 @@ class VideoWorker(QtCore.QObject):
                 # distal dot
                 cv2.circle(img, end_pt, vector_end_size, color, -1)
 
-                label = f"{vx:+.2f},{vy:+.2f} ({info['open_ratio']:.2f})"
+                # Text overlay with gaze values and eye open ratio
+                label = f"[{vx:+.3f}, {vy:+.3f}] ({info['open_ratio']:.2f})"
                 cv2.putText(
                     img,
                     label,

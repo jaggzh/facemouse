@@ -414,6 +414,9 @@ class CalibrationWindow(QtWidgets.QWidget):
         self.auto_collect_start = None
         self.auto_collect_samples = []
         
+        # Opacity/darkening toggle
+        self.darkening_enabled = True
+        
         # Computed cursor position (screen coordinates)
         self.cursor_screen_pos = None
         
@@ -464,6 +467,18 @@ class CalibrationWindow(QtWidgets.QWidget):
         btn_min_w = settings.scaled_size(150, settings.DEF_UI_SCALE_CAL_BUTTONS)
         btn_min_h = settings.scaled_size(50, settings.DEF_UI_SCALE_CAL_BUTTONS)
         
+        self.collect_btn = QtWidgets.QPushButton(f"(C)ollect {self.cal_auto_collect_s:.0f}s")
+        self.collect_btn.setFont(btn_font)
+        self.collect_btn.setMinimumSize(btn_min_w, btn_min_h)
+        self.collect_btn.clicked.connect(self._start_auto_collect)
+        
+        self.opacity_btn = QtWidgets.QPushButton("(O)pacity")
+        self.opacity_btn.setFont(btn_font)
+        self.opacity_btn.setMinimumSize(btn_min_w, btn_min_h)
+        self.opacity_btn.setCheckable(True)
+        self.opacity_btn.setChecked(True)  # Darkening on by default
+        self.opacity_btn.clicked.connect(self.toggle_opacity)
+        
         self.accept_btn = QtWidgets.QPushButton("Accept Point (A)")
         self.accept_btn.setFont(btn_font)
         self.accept_btn.setMinimumSize(btn_min_w, btn_min_h)
@@ -479,6 +494,8 @@ class CalibrationWindow(QtWidgets.QWidget):
         self.cancel_btn.setMinimumSize(btn_min_w, btn_min_h)
         self.cancel_btn.clicked.connect(self.cancel_calibration)
         
+        button_layout.addWidget(self.collect_btn)
+        button_layout.addWidget(self.opacity_btn)
         button_layout.addWidget(self.accept_btn)
         button_layout.addWidget(self.undo_btn)
         button_layout.addWidget(self.cancel_btn)
@@ -654,6 +671,13 @@ class CalibrationWindow(QtWidgets.QWidget):
             self.update()
     
     @QtCore.Slot()
+    def toggle_opacity(self):
+        """Toggle darkening overlay on/off."""
+        self.darkening_enabled = self.opacity_btn.isChecked()
+        print(f"[Calibration] Darkening {'enabled' if self.darkening_enabled else 'disabled'}")
+        self.update()
+    
+    @QtCore.Slot()
     def cancel_calibration(self):
         """Cancel calibration process."""
         self.calibrationCancelled.emit()
@@ -691,7 +715,12 @@ class CalibrationWindow(QtWidgets.QWidget):
         # Draw darkened video frame if available
         if self.current_frame is not None:
             h, w, ch = self.current_frame.shape
-            darkened = (self.current_frame * (1.0 - settings.DEF_CAL_VID_DARKEN)).astype(np.uint8)
+            
+            # Apply darkening if enabled
+            if self.darkening_enabled:
+                darkened = (self.current_frame * (1.0 - settings.DEF_CAL_VID_DARKEN)).astype(np.uint8)
+            else:
+                darkened = self.current_frame
             
             bytes_per_line = ch * w
             qimg = QtGui.QImage(darkened.data, w, h, bytes_per_line, QtGui.QImage.Format_BGR888)
@@ -819,6 +848,9 @@ class CalibrationWindow(QtWidgets.QWidget):
         elif key == QtCore.Qt.Key_C:
             if not self.auto_collecting:
                 self._start_auto_collect()
+        elif key == QtCore.Qt.Key_O:
+            self.opacity_btn.toggle()  # Toggle the button state
+            self.toggle_opacity()
         else:
             super().keyPressEvent(event)
 

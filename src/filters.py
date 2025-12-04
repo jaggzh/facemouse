@@ -12,7 +12,7 @@ from typing import Optional, Tuple
 
 
 # Default filter parameters (can be overridden)
-DEF_MEDIAN_WINDOW = 3  # Number of samples for median filter
+DEF_MEDIAN_WINDOW = 10  # Number of samples for median filter
 DEF_EMA_ALPHA = 0.3  # Exponential moving average smoothing factor (0=smooth, 1=responsive)
 DEF_FILTER_ENABLED = True  # Enable filtering by default
 
@@ -52,6 +52,8 @@ class LandmarkFilter:
         if len(self.median_buffer) >= 1:
             buffer_array = np.array(list(self.median_buffer))
             median_filtered = np.median(buffer_array, axis=0)
+            # print(f"Buffer: {buffer_array}")
+            # print(f"Median: {median_filtered}")
         else:
             median_filtered = point.copy()
         
