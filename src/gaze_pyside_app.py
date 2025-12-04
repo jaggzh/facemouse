@@ -593,6 +593,7 @@ class VideoWorker(QtCore.QObject):
         h, w, _ = img.shape
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(rgb)
+        print(f"{time.time()} mp facemesh")
 
         if not results.multi_face_landmarks:
             return img, None
