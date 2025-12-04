@@ -141,10 +141,24 @@ class CalibrationData:
         self.points = {}  # (screen_x, screen_y) -> list of samples
         
     def add_sample(self, screen_pos: Tuple[int, int], sample_data: Dict[str, Any]):
-        """Add a sample for a calibration point."""
+        """Add a sample for a calibration point (strips landmarks to save space)."""
         if screen_pos not in self.points:
             self.points[screen_pos] = []
-        self.points[screen_pos].append(sample_data)
+        
+        # Strip landmarks - we only need gaze vectors
+        clean_sample = {
+            'timestamp': sample_data.get('timestamp'),
+            'left_gaze': sample_data.get('left_gaze'),
+            'right_gaze': sample_data.get('right_gaze'),
+            'avg_gaze': sample_data.get('avg_gaze'),
+            'face_aim': sample_data.get('face_aim'),
+            'left_open': sample_data.get('left_open'),
+            'right_open': sample_data.get('right_open'),
+            'left_enabled': sample_data.get('left_enabled', True),
+            'right_enabled': sample_data.get('right_enabled', True),
+        }
+        
+        self.points[screen_pos].append(clean_sample)
     
     def remove_last_sample(self, screen_pos: Tuple[int, int]) -> bool:
         """Remove the last sample from a point. Returns True if successful."""
@@ -160,13 +174,22 @@ class CalibrationData:
         return len(self.points.get(screen_pos, []))
     
     def get_averaged_data(self) -> Dict[Tuple[int, int], Dict]:
-        """Get averaged gaze data for each calibration point (with outlier removal)."""
+        """Get averaged gaze data for each calibration point (with outlier removal).
+        
+        If data is already averaged (single sample per point from loaded file),
+        just returns it directly.
+        """
         averaged = {}
         for pos, samples in self.points.items():
             if not samples:
                 continue
             
-            # Collect all gaze vectors
+            # If only one sample, it's already averaged data from a loaded file
+            if len(samples) == 1:
+                averaged[pos] = samples[0]
+                continue
+            
+            # Multiple samples - need to remove outliers and average
             left_gazes = []
             right_gazes = []
             avg_gazes = []
@@ -211,17 +234,28 @@ class CalibrationData:
             return obj
     
     def to_dict(self) -> dict:
-        """Convert to dictionary for YAML serialization."""
-        # Convert samples to ensure no numpy types
-        converted_points = []
-        for pos, samples in self.points.items():
-            converted_samples = [
-                self._convert_to_python_types(sample) for sample in samples
-            ]
-            converted_points.append({
-                'screen_x': int(pos[0]),
-                'screen_y': int(pos[1]),
-                'samples': converted_samples
+        """Convert to dictionary for YAML serialization.
+        
+        Saves only averaged data (after outlier removal) to keep files small.
+        With auto-collection of 90+ samples, we don't need to keep all raw samples.
+        """
+        # Get averaged data (which does outlier removal)
+        averaged_data = self.get_averaged_data()
+        
+        # Convert to simple list format
+        averaged_points = []
+        for (screen_x, screen_y), data in averaged_data.items():
+            # Get original sample count for reference
+            sample_count = len(self.points.get((screen_x, screen_y), []))
+            
+            averaged_points.append({
+                'screen_x': int(screen_x),
+                'screen_y': int(screen_y),
+                'sample_count': sample_count,  # For reference
+                'left_gaze': data.get('left_gaze'),
+                'right_gaze': data.get('right_gaze'),
+                'avg_gaze': data.get('avg_gaze'),
+                'face_aim': data.get('face_aim'),
             })
         
         return {
@@ -232,21 +266,40 @@ class CalibrationData:
             'sort_order': self.sort_order,
             'grid_size': self.grid_size,
             'timestamp': self.timestamp.isoformat(),
-            'points': converted_points
+            'points': averaged_points
         }
     
     @classmethod
     def from_dict(cls, data: dict) -> 'CalibrationData':
-        """Create from dictionary loaded from YAML."""
+        """Create from dictionary loaded from YAML.
+        
+        Handles both old format (with samples array) and new format (averaged data).
+        """
         cal = cls(name=data.get('name', ''), grid_size=data.get('grid_size', 9))
         cal.camera_description = data.get('camera_description', '')
         cal.display_description = data.get('display_description', '')
         cal.is_favorite = data.get('is_favorite', False)
         cal.sort_order = data.get('sort_order', 0)
         cal.timestamp = datetime.fromisoformat(data['timestamp'])
+        
         for pt_data in data.get('points', []):
             pos = (pt_data['screen_x'], pt_data['screen_y'])
-            cal.points[pos] = pt_data['samples']
+            
+            # Check if this is old format (has 'samples' key) or new format (direct data)
+            if 'samples' in pt_data:
+                # Old format - has array of samples
+                cal.points[pos] = pt_data['samples']
+            else:
+                # New format - has averaged data, create a single "sample" from it
+                # This maintains compatibility with get_averaged_data()
+                averaged_sample = {
+                    'left_gaze': pt_data.get('left_gaze'),
+                    'right_gaze': pt_data.get('right_gaze'),
+                    'avg_gaze': pt_data.get('avg_gaze'),
+                    'face_aim': pt_data.get('face_aim'),
+                }
+                cal.points[pos] = [averaged_sample]  # Single sample representing the average
+        
         return cal
     
     def save(self, filename: Optional[Path] = None) -> Path:

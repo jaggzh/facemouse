@@ -147,7 +147,13 @@ class VideoWorker(QtCore.QObject):
         self._contrast_lock = QtCore.QMutex()
         self._brightness_lock = QtCore.QMutex()
 
-        # Landmark filtering
+        # Landmark filtering - only filter landmarks we actually use
+        self._used_landmark_indices = set(
+            LEFT_IRIS + [LEFT_PUPIL] + LEFT_EYE_CORNERS + LEFT_EYE_LIDS +
+            RIGHT_IRIS + [RIGHT_PUPIL] + RIGHT_EYE_CORNERS + RIGHT_EYE_LIDS +
+            NOSE_TIP_POINTS + CHEEKBONE_R + CHEEKBONE_L + 
+            [FOREHEAD_TOP_R, FOREHEAD_TOP_L] + CHIN_TIP_POINTS
+        )
         self._landmark_filter = filters.LandmarkFilterSet(
             median_window=DEF_MEDIAN_WINDOW,
             ema_alpha=DEF_EMA_ALPHA,
@@ -159,8 +165,14 @@ class VideoWorker(QtCore.QObject):
         self._eye_open_thresh = 0.20
 
         # Landmark visualization toggles
-        self._show_landmarks_all = True  # Default ON
-        self._show_landmarks_used = True
+        self._show_landmarks_raw = False  # Raw unfiltered landmarks
+        self._show_landmarks_all = True  # Filtered landmarks (all)
+        self._show_landmarks_used = True  # Special highlighting of used landmarks
+        
+        # Eye enable/disable toggles
+        self._left_eye_enabled = True
+        self._right_eye_enabled = True
+        self._eye_enable_lock = QtCore.QMutex()
 
         # Mediapipe face mesh setup
         mp_face_mesh = mp.solutions.face_mesh
@@ -193,12 +205,28 @@ class VideoWorker(QtCore.QObject):
             print(f"[Worker] Contrast set to {self._contrast}")
 
     @QtCore.Slot(bool)
+    def set_show_landmarks_raw(self, enabled: bool):
+        self._show_landmarks_raw = bool(enabled)
+
+    @QtCore.Slot(bool)
     def set_show_landmarks_all(self, enabled: bool):
         self._show_landmarks_all = bool(enabled)
 
     @QtCore.Slot(bool)
     def set_show_landmarks_used(self, enabled: bool):
         self._show_landmarks_used = bool(enabled)
+    
+    @QtCore.Slot(bool)
+    def set_left_eye_enabled(self, enabled: bool):
+        with QtCore.QMutexLocker(self._eye_enable_lock):
+            self._left_eye_enabled = bool(enabled)
+            print(f"[Worker] Left eye {'enabled' if enabled else 'disabled'}")
+    
+    @QtCore.Slot(bool)
+    def set_right_eye_enabled(self, enabled: bool):
+        with QtCore.QMutexLocker(self._eye_enable_lock):
+            self._right_eye_enabled = bool(enabled)
+            print(f"[Worker] Right eye {'enabled' if enabled else 'disabled'}")
 
     # ---- Slots for landmark filter parameters ----
 
@@ -593,10 +621,9 @@ class VideoWorker(QtCore.QObject):
         h, w, _ = img.shape
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         results = self.face_mesh.process(rgb)
-        print(f"{time.time()} mp facemesh")
 
         if not results.multi_face_landmarks:
-            return img, None
+            return img, None  # Return tuple - fix video freeze when no face detected, None
 
         face_landmarks = results.multi_face_landmarks[0]
 
@@ -607,24 +634,40 @@ class VideoWorker(QtCore.QObject):
         vector_end_size = max(1, int(DEF_VECTOR_END_SIZE * base_lm_scaler))
 
         def lm(idx: int):
+            """Get filtered landmark position (only filters landmarks we use)."""
             p = face_landmarks.landmark[idx]
             raw_point = np.array([p.x, p.y, p.z], dtype=np.float32)
-            # Apply filtering
-            with QtCore.QMutexLocker(self._filter_lock):
-                filtered_point = self._landmark_filter.update(idx, raw_point)
-            return filtered_point
+            
+            # Only filter landmarks we actually use
+            if idx in self._used_landmark_indices:
+                with QtCore.QMutexLocker(self._filter_lock):
+                    filtered_point = self._landmark_filter.update(idx, raw_point)
+                return filtered_point
+            else:
+                # Not used, return raw
+                return raw_point
         
         def lm_avg(indices):
             """Average position of multiple landmarks."""
             pts = np.array([lm(i) for i in indices], dtype=np.float32)
             return pts.mean(axis=0)
 
-        # Draw all landmarks (into a separate overlay) if enabled
+        # Draw landmarks in order: raw -> filtered -> special (so they layer correctly)
         overlay = img.copy()
-        if self._show_landmarks_all:
+        
+        # 1. Draw raw unfiltered landmarks if enabled (gray, drawn first so filtered draw over)
+        if self._show_landmarks_raw:
             for idx, p in enumerate(face_landmarks.landmark):
                 x = int(p.x * w)
                 y = int(p.y * h)
+                cv2.circle(overlay, (x, y), lm_size, (128, 128, 128), -1)  # Gray
+        
+        # 2. Draw filtered landmarks (all) if enabled (normal color, draws over raw)
+        if self._show_landmarks_all:
+            for idx, p in enumerate(face_landmarks.landmark):
+                filt = lm(idx)  # Get filtered version
+                x = int(filt[0] * w)
+                y = int(filt[1] * h)
                 cv2.circle(overlay, (x, y), lm_size, COLOR_LM_ALL, -1)
 
         # Helper to compute eye metrics given index sets
@@ -670,6 +713,11 @@ class VideoWorker(QtCore.QObject):
 
         left = eye_info(LEFT_IRIS, LEFT_PUPIL, LEFT_EYE_CORNERS, LEFT_EYE_LIDS)
         right = eye_info(RIGHT_IRIS, RIGHT_PUPIL, RIGHT_EYE_CORNERS, RIGHT_EYE_LIDS)
+        
+        # Check which eyes are enabled
+        with QtCore.QMutexLocker(self._eye_enable_lock):
+            left_eye_enabled = self._left_eye_enabled
+            right_eye_enabled = self._right_eye_enabled
 
         # Highlight the specific landmarks we are using, if requested
         # Draw them with darker versions of their associated vector colors
@@ -724,7 +772,9 @@ class VideoWorker(QtCore.QObject):
 
         # Draw per-eye gaze vectors (in normalized eye space)
         def draw_eye_vector(info, is_open: bool, color):
-            cx, cy = info["eye_px"]
+            # Use iris center as origin, not eye center
+            iris_center = info["iris_center"]
+            cx, cy = int(iris_center[0] * w), int(iris_center[1] * h)
             vx, vy = info["dir_norm"]
 
             if is_open:
@@ -761,16 +811,18 @@ class VideoWorker(QtCore.QObject):
                     cv2.LINE_AA,
                 )
 
-        draw_eye_vector(left, left_open, COLOR_GAZE_LEFT)
-        draw_eye_vector(right, right_open, COLOR_GAZE_RIGHT)
+        draw_eye_vector(left, left_open and left_eye_enabled, COLOR_GAZE_LEFT)
+        draw_eye_vector(right, right_open and right_eye_enabled, COLOR_GAZE_RIGHT)
 
-        # Combined gaze (average of open eyes) – for now just a debug indicator
+        # Combined gaze (average of open AND enabled eyes)
         open_dirs = []
         centers_px = []
-        for info, is_open in ((left, left_open), (right, right_open)):
-            if is_open:
+        for info, is_open, is_enabled in ((left, left_open, left_eye_enabled), (right, right_open, right_eye_enabled)):
+            if is_open and is_enabled:
                 open_dirs.append(info["dir_norm"])
-                centers_px.append(info["eye_px"])
+                # Use iris center for combined gaze origin
+                iris_px = (int(info["iris_center"][0] * w), int(info["iris_center"][1] * h))
+                centers_px.append(iris_px)
 
         if open_dirs:
             avg_dir = np.mean(open_dirs, axis=0)
@@ -872,12 +924,14 @@ class VideoWorker(QtCore.QObject):
         # Package gaze data for calibration/logging
         gaze_data = {
             'timestamp': datetime.now().isoformat(),
-            'left_gaze': left["dir_norm"].tolist() if left_open else None,
-            'right_gaze': right["dir_norm"].tolist() if right_open else None,
+            'left_gaze': left["dir_norm"].tolist() if (left_open and left_eye_enabled) else None,
+            'right_gaze': right["dir_norm"].tolist() if (right_open and right_eye_enabled) else None,
             'avg_gaze': avg_dir.tolist() if open_dirs else None,
             'face_aim': face_dir.tolist(),
             'left_open': left_open,
             'right_open': right_open,
+            'left_enabled': left_eye_enabled,
+            'right_enabled': right_eye_enabled,
             'landmarks': {idx: [p.x, p.y, p.z] for idx, p in enumerate(face_landmarks.landmark)}
         }
 
@@ -1273,6 +1327,11 @@ class MainWindow(QtWidgets.QMainWindow):
         overlay_layout = QtWidgets.QVBoxLayout()
         
         # Landmark toggles
+        self.show_raw_lm_cb = QtWidgets.QCheckBox("Raw LMs (unfiltered)")
+        self.show_raw_lm_cb.setChecked(False)
+        self.show_raw_lm_cb.toggled.connect(
+            self.worker.set_show_landmarks_raw, QtCore.Qt.DirectConnection)
+        
         self.show_all_lm_cb = QtWidgets.QCheckBox("Show all landmarks")
         self.show_all_lm_cb.setChecked(True)  # Default ON
         self.show_used_lm_cb = QtWidgets.QCheckBox("Highlight gaze landmarks")
@@ -1283,6 +1342,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_used_lm_cb.toggled.connect(
             self.worker.set_show_landmarks_used, QtCore.Qt.DirectConnection)
         
+        overlay_layout.addWidget(self.show_raw_lm_cb)
         overlay_layout.addWidget(self.show_all_lm_cb)
         overlay_layout.addWidget(self.show_used_lm_cb)
         overlay_group.setLayout(overlay_layout)
@@ -1298,8 +1358,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.legend_widget = ColorLegendWidget()
         
         # Landmark filter controls group
-        filter_group = QtWidgets.QGroupBox("Landmark Filtering")
+        filter_group = QtWidgets.QGroupBox("Landmark Options")
         filter_layout = QtWidgets.QFormLayout()
+        
+        # Eye enable checkboxes
+        eye_layout = QtWidgets.QHBoxLayout()
+        self.left_eye_cb = QtWidgets.QCheckBox("Left eye")
+        self.left_eye_cb.setChecked(True)
+        self.left_eye_cb.toggled.connect(
+            self.worker.set_left_eye_enabled, QtCore.Qt.DirectConnection)
+        eye_layout.addWidget(self.left_eye_cb)
+        
+        self.right_eye_cb = QtWidgets.QCheckBox("Right eye")
+        self.right_eye_cb.setChecked(True)
+        self.right_eye_cb.toggled.connect(
+            self.worker.set_right_eye_enabled, QtCore.Qt.DirectConnection)
+        eye_layout.addWidget(self.right_eye_cb)
+        
+        filter_layout.addRow(eye_layout)
         
         # Filter enable toggle
         self.filter_enabled_cb = QtWidgets.QCheckBox("Enable filtering")
