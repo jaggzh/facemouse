@@ -595,7 +595,7 @@ class VideoWorker(QtCore.QObject):
         results = self.face_mesh.process(rgb)
 
         if not results.multi_face_landmarks:
-            return img
+            return img, None
 
         face_landmarks = results.multi_face_landmarks[0]
 
@@ -934,7 +934,7 @@ class ColorLegendWidget(QtWidgets.QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(150)  # Increased for note
+        self.setMinimumHeight(130)
         
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
@@ -943,13 +943,8 @@ class ColorLegendWidget(QtWidgets.QWidget):
         # Background
         painter.fillRect(self.rect(), QtGui.QColor(240, 240, 240))
         
-        # Title
-        painter.setPen(QtCore.Qt.black)
-        painter.setFont(QtGui.QFont("Sans", 10, QtGui.QFont.Bold))
-        painter.drawText(10, 20, "Color Legend")
-        
-        # Legend items
-        y_offset = 40
+        # Legend items (no title)
+        y_offset = 15
         line_height = 20
         
         legend_items = [
@@ -979,16 +974,60 @@ class ColorLegendWidget(QtWidgets.QWidget):
         painter.drawText(10, y_offset + 5, "Note: Feature landmarks are darker")
 
 
+class HotkeyHelpWidget(QtWidgets.QWidget):
+    """Widget showing keyboard shortcuts."""
+    
+    def __init__(self, is_video_file=False, parent=None):
+        super().__init__(parent)
+        self.is_video_file = is_video_file
+        self.setMinimumHeight(120 if is_video_file else 60)
+        
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        
+        # Background
+        painter.fillRect(self.rect(), QtGui.QColor(240, 240, 240))
+        
+        # Hotkeys
+        y_offset = 15
+        line_height = 16
+        
+        painter.setFont(QtGui.QFont("Monospace", 9))
+        painter.setPen(QtCore.Qt.black)
+        
+        hotkeys = [
+            ("C", "Start calibration"),
+            ("M", "Toggle mouse control"),
+            ("Q", "Quit"),
+        ]
+        
+        if self.is_video_file:
+            hotkeys.extend([
+                ("Space", "Pause/Play"),
+                ("←/→", "Step frame"),
+                ("Home/End", "Jump start/end"),
+            ])
+        
+        for key, desc in hotkeys:
+            text = f"{key:8s} {desc}"
+            painter.drawText(10, y_offset, text)
+            y_offset += line_height
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, video_file=None, usb_device=None, dev_device=None,
                  frame_delay=DEF_VFILE_FRAME_DELAY,
                  vfile_fps=DEF_VFILE_FPS, loop=DEF_VFILE_LOOP,
-                 mouse_control=False):
+                 mouse_control=False, cal_auto_collect_s=3.0):
         super().__init__()
         self.setWindowTitle("Eye Gaze Tracker - Accessibility HID Controller")
         
         # Mouse control state
         self.mouse_control_enabled = mouse_control
+        
+        # Calibration auto-collect duration
+        self.cal_auto_collect_s = cal_auto_collect_s
         
         # Active calibration preset
         self.active_preset = None
@@ -1137,6 +1176,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.shortcut_quit = QtGui.QShortcut(QtGui.QKeySequence("Q"), self)
         self.shortcut_quit.activated.connect(self.close)
         
+        # Mouse control toggle
+        self.shortcut_mouse = QtGui.QShortcut(QtGui.QKeySequence("M"), self)
+        self.shortcut_mouse.activated.connect(lambda: self.mouse_control_action.toggle())
+        
+        # Calibration
+        self.shortcut_calib = QtGui.QShortcut(QtGui.QKeySequence("C"), self)
+        self.shortcut_calib.activated.connect(self.start_calibration)
+        
         # Video controls (only for file playback)
         if self.is_video_file:
             self.shortcut_pause = QtGui.QShortcut(QtGui.QKeySequence("Space"), self)
@@ -1239,26 +1286,15 @@ class MainWindow(QtWidgets.QMainWindow):
         overlay_layout.addWidget(self.show_used_lm_cb)
         overlay_group.setLayout(overlay_layout)
         
-        # Color legend
-        legend_group = QtWidgets.QGroupBox("Color Legend")
-        legend_layout = QtWidgets.QVBoxLayout()
-        self.legend_widget = ColorLegendWidget()
-        legend_layout.addWidget(self.legend_widget)
-        legend_group.setLayout(legend_layout)
+        # Hotkey help (compact)
+        help_group = QtWidgets.QGroupBox("Hotkeys")
+        help_layout = QtWidgets.QVBoxLayout()
+        self.hotkey_widget = HotkeyHelpWidget(is_video_file=is_video_file)
+        help_layout.addWidget(self.hotkey_widget)
+        help_group.setLayout(help_layout)
         
-        # Video controls help (if video file)
-        if is_video_file:
-            help_group = QtWidgets.QGroupBox("Video Controls")
-            help_layout = QtWidgets.QVBoxLayout()
-            help_text = QtWidgets.QLabel(
-                "Space: Pause/Play\n"
-                "←/→: Step frame\n"
-                "Home/End: Jump to start/end\n"
-                "Q: Quit"
-            )
-            help_text.setFont(QtGui.QFont("Monospace", 9))
-            help_layout.addWidget(help_text)
-            help_group.setLayout(help_layout)
+        # Color legend (no title label)
+        self.legend_widget = ColorLegendWidget()
         
         # Landmark filter controls group
         filter_group = QtWidgets.QGroupBox("Landmark Filtering")
@@ -1337,9 +1373,8 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(img_group)
         layout.addWidget(overlay_group)
         layout.addWidget(filter_group)
-        layout.addWidget(legend_group)
-        if is_video_file:
-            layout.addWidget(help_group)
+        layout.addWidget(help_group)
+        layout.addWidget(self.legend_widget)
         layout.addWidget(QtWidgets.QLabel())  # Spacer
         layout.addLayout(buttons_layout)
         layout.addStretch()
@@ -1404,7 +1439,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.calibration_window = calibration.CalibrationWindow(
             screen_size=screen_size,
             grid_size=app_settings.DEF_CAL_GRID_SIZE,
-            active_preset=self.active_preset
+            active_preset=self.active_preset,
+            cal_auto_collect_s=self.cal_auto_collect_s
         )
         
         # Connect worker gaze data to calibration window (DirectConnection for responsiveness)
@@ -1452,14 +1488,17 @@ class MainWindow(QtWidgets.QMainWindow):
     
     def _refresh_preset_buttons(self):
         """Refresh favorite preset buttons in toolbar."""
+        print("[UI] Refreshing preset buttons...")
+        start_time = time.time()
+        
         # Remove old preset actions
         for action in self.preset_actions:
             self.toolbar.removeAction(action)
         self.preset_actions.clear()
         
-        # Add favorite presets as buttons
+        # Add favorite presets as buttons (only loads favorites, not all presets)
         favorites = calibration.CalibrationData.get_favorites()
-        print(f"[UI] Refreshing preset buttons, found {len(favorites)} favorites")
+        print(f"[UI] Found {len(favorites)} favorites in {time.time() - start_time:.2f}s")
         
         for preset in favorites:
             action = QtGui.QAction(f"⭐ {preset.name}", self)
@@ -1477,6 +1516,8 @@ class MainWindow(QtWidgets.QMainWindow):
             
             self.toolbar.addAction(action)
             self.preset_actions.append(action)
+        
+        print(f"[UI] Preset buttons refreshed in {time.time() - start_time:.2f}s")
 
     def toggle_mouse_control(self, enabled: bool):
         """Toggle mouse control on/off."""
@@ -1593,6 +1634,8 @@ Video File Controls:
   Space     Pause/Play
   ←/→       Step backward/forward one frame
   Home/End  Jump to start/end of video
+  C         Start calibration
+  M         Toggle mouse control
   Q         Quit application
   
 Camera Sources:
@@ -1602,59 +1645,26 @@ Camera Sources:
   -f/--file: Video file for testing
         """
     )
-    parser.add_argument(
-        "-f", "--file",
-        type=str,
-        help="Path to video file for testing (instead of live camera stream)"
-    )
-    parser.add_argument(
-        "--usb",
-        type=str,
-        help="USB camera identifier (e.g., 'usb-0000:1a:00.0'). Lists devices with v4l2-ctl --list-devices"
-    )
-    parser.add_argument(
-        "--dev",
-        type=str,
-        help="Direct device path (e.g., /dev/video0 or just '0' for /dev/video0)"
-    )
-    parser.add_argument(
-        "--no-loop",
-        action="store_true",
-        help=f"Disable video looping (default: loop enabled)"
-    )
-    parser.add_argument(
-        "--vfile-fps", "--ffps",
-        type=float,
-        metavar="FPS",
-        help=f"Playback FPS for video file. Overrides --vfile-frame-delay. (default: use frame delay)"
-    )
-    parser.add_argument(
-        "--vfile-frame-delay", "--fd",
-        type=float,
-        metavar="SECONDS",
-        default=DEF_VFILE_FRAME_DELAY,
-        help=f"Delay between video file frames in seconds. Float. (default: {DEF_VFILE_FRAME_DELAY})"
-    )
-    parser.add_argument(
-        "--mouse",
-        action="store_true",
-        help="Enable mouse control on startup (default: off, visualization only)"
-    )
+    parser.add_argument("-f", "--file", type=str, help="Path to video file for testing")
+    parser.add_argument("--usb", type=str, help="USB camera identifier")
+    parser.add_argument("--dev", type=str, help="Direct device path (e.g., /dev/video0)")
+    parser.add_argument("--no-loop", action="store_true", help="Disable video looping")
+    parser.add_argument("--vfile-fps", "--ffps", type=float, metavar="FPS", help="Playback FPS for video file")
+    parser.add_argument("--vfile-frame-delay", "--fd", type=float, metavar="SECONDS", 
+                       default=DEF_VFILE_FRAME_DELAY, help=f"Delay between video file frames (default: {DEF_VFILE_FRAME_DELAY})")
+    parser.add_argument("--mouse", action="store_true", help="Enable mouse control on startup")
+    parser.add_argument("--cal-auto-s", type=float, default=3.0, metavar="SECONDS",
+                       help="Duration for 'C' key auto-collection in calibration (default: 3.0)")
     
     args = parser.parse_args()
     
-    # Validate camera source options (only one should be specified)
-    camera_sources = sum([
-        args.file is not None,
-        args.usb is not None,
-        args.dev is not None
-    ])
-    
+    # Validate camera source options
+    camera_sources = sum([args.file is not None, args.usb is not None, args.dev is not None])
     if camera_sources > 1:
         print("Error: Only one camera source can be specified (--file, --usb, or --dev)")
         sys.exit(1)
     
-    # Process --dev shorthand (e.g., "0" -> "/dev/video0")
+    # Process --dev shorthand
     dev_device = args.dev
     if dev_device and dev_device.isdigit():
         dev_device = f"/dev/video{dev_device}"
@@ -1667,7 +1677,8 @@ Camera Sources:
         frame_delay=args.vfile_frame_delay,
         vfile_fps=args.vfile_fps,
         loop=(not args.no_loop),
-        mouse_control=args.mouse
+        mouse_control=args.mouse,
+        cal_auto_collect_s=args.cal_auto_s
     )
     win.resize(1400, 900)
     win.show()

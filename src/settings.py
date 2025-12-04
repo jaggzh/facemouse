@@ -79,10 +79,10 @@ DEF_CAL_GRID_SIZE = 9  # Default grid point count
 DEF_CAL_NO_TTS = False  # Enable TTS by default
 CAL_TTS_MESSAGES = {
     'start': 'Starting calibration',
-    'point': 'Look at the {direction}',
-    'accepted': 'Point accepted',
-    'undo': 'Point removed',
-    'complete': 'Calibration complete',
+    'point': '{direction}',
+    'accepted': 'Accepted',
+    'undo': 'Removed',
+    'complete': 'Complete',
 }
 
 # Paths
