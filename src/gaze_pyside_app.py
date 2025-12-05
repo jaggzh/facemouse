@@ -112,7 +112,7 @@ CHEEKBONE_R = [34, 143, 116]
 CHEEKBONE_L = [254, 372, 345]
 FOREHEAD_TOP_R = 103
 FOREHEAD_TOP_L = 332
-CHIN_TIP_POINTS = [203, 428, 175]
+CHIN_TIP_POINTS = [208, 428, 175]
 
 
 class VideoWorker(QtCore.QObject):
@@ -799,7 +799,7 @@ class VideoWorker(QtCore.QObject):
                 cv2.putText(
                     img,
                     label,
-                    (end_pt[0] + 5, end_pt[1]),
+                    (end_pt[0] + 5, end_pt[1]-20),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.4,
                     color,
