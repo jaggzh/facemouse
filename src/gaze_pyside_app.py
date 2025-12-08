@@ -116,6 +116,28 @@ FOREHEAD_TOP_R = 103
 FOREHEAD_TOP_L = 332
 CHIN_TIP_POINTS = [208, 428, 175]  # Corrected chin tip points
 
+# ============================================================================
+# Plot data output helper
+# ============================================================================
+# Global print_data level (set from args in main())
+_print_data_level = 0
+
+def set_print_data_level(level: int):
+    """Set the global print data verbosity level."""
+    global _print_data_level
+    _print_data_level = level
+
+def termplot(level: int, line: str):
+    """Print plot data if verbosity level is high enough.
+    
+    Usage:
+        termplot(1, "PLOT:EYE_L.x:{:.4f} PLOT:EYE_L.y:{:.4f}".format(x, y))
+    
+    Output can be filtered with:
+        ./gaze.py -P 1 | grep ^PLOT: | sed 's/^PLOT://' | splotty -
+    """
+    if _print_data_level >= level:
+        print(line)
 
 class VideoWorker(QtCore.QObject):
     """Background worker: decodes H.264 or video file, applies pre-filter, runs Mediapipe,
@@ -811,18 +833,32 @@ class VideoWorker(QtCore.QObject):
         final_face_vector = final_face_vector / (np.linalg.norm(final_face_vector) + 1e-6)
         face_dir_prelim = np.array([final_face_vector[0], final_face_vector[1]], dtype=np.float32)
         
-        # Transform each eye's gaze: rotate to head space, then subtract face-aim
+        # Store raw eye gaze before transformation (for debug output)
+        left_raw = left["dir_norm"].copy()
+        right_raw = right["dir_norm"].copy()
+        
+        # Transform each eye's gaze: rotate to head space, then ADD face-aim
+        # Rationale: If eyes look at world angle +20, head turns +5 toward target,
+        # eye-relative gaze shifts to +15. World gaze = eye-relative + head = 15 + 5 = 20
         def transform_gaze(gaze_2d):
-            """Transform gaze into head-aligned coordinates and subtract face-aim."""
+            """Transform gaze into world coordinates by adding face-aim."""
             # Rotate to head-aligned coordinates
             rotated = rotation_matrix @ gaze_2d
-            # Subtract face-aim to get relative gaze (compensates for head orientation)
-            corrected = rotated - face_dir_prelim
+            # ADD face-aim to get world-space gaze direction
+            corrected = rotated + face_dir_prelim
             return corrected
         
         # Apply transformation to eye gaze vectors (modifies in place)
         left["dir_norm"] = transform_gaze(left["dir_norm"])
         right["dir_norm"] = transform_gaze(right["dir_norm"])
+        
+        # Output plot data at level 1
+        if _print_data_level >= 1:
+            termplot(1, f"PLOT:EYE_L_RAW.x:{left_raw[0]:.4f} PLOT:EYE_L_RAW.y:{left_raw[1]:.4f} "
+                       f"PLOT:EYE_R_RAW.x:{right_raw[0]:.4f} PLOT:EYE_R_RAW.y:{right_raw[1]:.4f} "
+                       f"PLOT:FACE.x:{face_dir_prelim[0]:.4f} PLOT:FACE.y:{face_dir_prelim[1]:.4f} "
+                       f"PLOT:EYE_L.x:{left['dir_norm'][0]:.4f} PLOT:EYE_L.y:{left['dir_norm'][1]:.4f} "
+                       f"PLOT:EYE_R.x:{right['dir_norm'][0]:.4f} PLOT:EYE_R.y:{right['dir_norm'][1]:.4f}")
         
         # Check which eyes are enabled
         with QtCore.QMutexLocker(self._eye_enable_lock):
@@ -955,6 +991,10 @@ class VideoWorker(QtCore.QObject):
                 1,
                 cv2.LINE_AA,
             )
+            
+            # Output combined/avg gaze at level 1
+            if _print_data_level >= 1:
+                termplot(1, f"PLOT:EYES.x:{avg_dir[0]:.4f} PLOT:EYES.y:{avg_dir[1]:.4f}")
             
             # Track persistent max gaze bounds
             with QtCore.QMutexLocker(self._gaze_bounds_lock):
@@ -1287,8 +1327,8 @@ class FiltersDialog(QtWidgets.QDialog):
         
         self.resize(400, 600)
         
-        # Trigger initial values to worker
-        self.apply_current_values()
+        # Don't apply values here - let the caller decide when to apply
+        # (either defaults on first open, or loaded settings)
     
     def apply_current_values(self):
         """Apply current UI values to worker (for initialization or after loading)."""
@@ -1397,23 +1437,24 @@ class MainWindow(QtWidgets.QMainWindow):
         # Setup global keyboard shortcuts
         self._setup_shortcuts()
         
-        # Load saved settings
+        # Initialize filter dialog state BEFORE loading settings
+        self.filters_dialog = None
+        self.saved_filter_settings = None
+        
+        # Load saved settings (will populate saved_filter_settings if found)
         self.load_settings()
 
         self.thread.start()
-        
-        # Create filters dialog (but don't show it yet)
-        self.filters_dialog = None
-        self.saved_filter_settings = None
     
     def open_filters_dialog(self):
         """Open the filters configuration dialog."""
         if self.filters_dialog is None:
             self.filters_dialog = FiltersDialog(self.worker, self)
-            # Apply saved settings if we have them
+            # Apply saved settings if we have them, otherwise apply defaults
             if self.saved_filter_settings is not None:
                 self.filters_dialog.set_settings(self.saved_filter_settings)
-                self.filters_dialog.apply_current_values()
+            # Apply current UI values to worker (either loaded or defaults)
+            self.filters_dialog.apply_current_values()
         self.filters_dialog.show()
         self.filters_dialog.raise_()
         self.filters_dialog.activateWindow()
@@ -1801,9 +1842,18 @@ class MainWindow(QtWidgets.QMainWindow):
             if 'right_eye_enabled' in config:
                 self.right_eye_cb.setChecked(config['right_eye_enabled'])
             
-            # Store filter settings to apply when dialog is created
+            # Apply filter settings to worker immediately
             if 'filters' in config:
                 self.saved_filter_settings = config['filters']
+                # Send to worker right away (don't wait for dialog to open)
+                for group, settings in self.saved_filter_settings.items():
+                    if 'enabled' in settings:
+                        self.worker.set_filter_enabled(group, settings['enabled'])
+                    if 'median_window' in settings:
+                        self.worker.set_filter_median_window(group, settings['median_window'])
+                    if 'ema_alpha' in settings:
+                        self.worker.set_filter_ema_alpha(group, settings['ema_alpha'])
+                print(f"[UI] Applied filter settings from config")
             else:
                 self.saved_filter_settings = None
             
@@ -1818,8 +1868,17 @@ class MainWindow(QtWidgets.QMainWindow):
             return  # Already calibrating
         
         # Create calibration window
-        screen_size = self.screen().size()
+        screen = self.screen()
+        screen_geom = screen.geometry()
+        screen_size = screen_geom.size()  # Logical size for Qt drawing
+        dpr = screen.devicePixelRatio()    # For converting to physical coordinates
+        
+        print(f"[UI] Screen DPR: {dpr}")
+        print(f"[UI] Logical size (for drawing): {screen_size.width()}x{screen_size.height()}")
+        print(f"[UI] Physical size (for mouse): {int(screen_size.width() * dpr)}x{int(screen_size.height() * dpr)}")
+        
         self.calibration_window = calibration.CalibrationWindow(
+            device_pixel_ratio=dpr,  # Pass DPR for coordinate conversion
             screen_size=screen_size,
             grid_size=app_settings.DEF_CAL_GRID_SIZE,
             active_preset=self.active_preset,
@@ -1836,6 +1895,13 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Show calibration window
         self.calibration_window.showFullScreen()
+        
+        # Process events to ensure window is fully shown and sized
+        QtCore.QCoreApplication.processEvents()
+        
+        # Finalize calibration setup (regenerates grid if window size changed)
+        self.calibration_window.finalize_after_show()
+        
         self.status.showMessage("Calibration in progress...")
     
     def on_calibration_complete(self, cal_data: calibration.CalibrationData):
@@ -2038,8 +2104,13 @@ Camera Sources:
     parser.add_argument("--mouse", action="store_true", help="Enable mouse control on startup")
     parser.add_argument("--cal-auto-s", type=float, default=3.0, metavar="SECONDS",
                        help="Duration for 'C' key auto-collection in calibration (default: 3.0)")
+    parser.add_argument("-P", "--print-data", type=int, default=0, metavar="LEVEL",
+                       help="Verbosity level for plot data output (0=off, 1+=on)")
     
     args = parser.parse_args()
+    
+    # Set global print data level
+    set_print_data_level(args.print_data)
     
     # Validate camera source options
     camera_sources = sum([args.file is not None, args.usb is not None, args.dev is not None])

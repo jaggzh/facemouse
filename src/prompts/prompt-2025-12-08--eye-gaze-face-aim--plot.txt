@@ -1,0 +1,28 @@
+In this code (eye-gaze -> mouse control HID), we're subtracting the face aim vector from the eye gaze vectors.
+
+Originally we used just the eye gaze vectors (averaged), but I then realized that the person might turn their head a little bit towards their target, while keeping their eyes fixed on the target; thus, the eye gaze with respect to the face would shift the opposite direction.
+so if the eyes go to some arbitrary angle, let's say.. "+20" (rotation around y). And they're looking at their target on the display now.
+
+but they turn their head a bit towards that direction, let's say "+5".
+As they move their head +5, their eyes would shift back slightly.. to "15".
+So the final aim is really 15+5, or an ADDITION of the vectors, not subtraction.
+
+At present, I think we're subtracting the face aim from each eye (which is causing the normal "outwards" (which is weird, but possibly normal) ... causing those vectors to go cross-eyed instead. I think we can use the original version of each eye vector, average it, then ADD the face aim to it.
+
+Can we plot values?  I think let's just print them to stdout with (--print-data / -P {int}) where int is a verbosity level of our plot data.
+
+I have a streaming text plotter which can plot it (rather than incorporate this debug plot into something in our UI).
+If we preface the data by names I can filter it, ./gaze.py | grep ... | sed | splotty - # my plotter
+
+If args.plot_data > 0:
+  print f"PLOT:EYE_L.x: {eye_l.x} "
+  print f"PLOT:EYE_L.y: {eye_l.y} "
+  print f"PLOT:EYES.x: {eye_combined.x} "  # Notice the short "EYES.x" label so the plotter doesn't take up too much space with labels. I would sed s/^PLOT://'
+  print "\n"; # the plotter uses arduino-style lines of space-separated column data "{label}:{value}".join(' ') (and I stripped the PLOT: so we can grep filter the plot data from our other output.
+
+Probably we use a 
+sub termplotl(l, line): # "terminal plot (l)evel"
+  if args.print_data >= l: # verbose enough plot level (we only handle >=1 right now)
+  	  print(line)
+
+Does this sound good?

@@ -394,9 +394,11 @@ class CalibrationWindow(QtWidgets.QWidget):
     progressToNext = QtCore.Signal()  # Signal to move to next point (from worker thread)
     
     def __init__(self, screen_size: QtCore.QSize, grid_size: int = settings.DEF_CAL_GRID_SIZE, 
-                 active_preset: CalibrationData = None, cal_auto_collect_s: float = 2.0, parent=None):
+                 active_preset: CalibrationData = None, cal_auto_collect_s: float = 3.0, 
+                 device_pixel_ratio: float = 1.0, parent=None):
         super().__init__(parent)
-        self.screen_size = screen_size
+        self.screen_size = screen_size  # Logical size for Qt drawing
+        self.device_pixel_ratio = device_pixel_ratio  # For converting to physical coordinates
         self.grid_size = grid_size
         self.active_preset = active_preset  # For cursor visualization
         self.cal_auto_collect_s = cal_auto_collect_s
@@ -426,18 +428,37 @@ class CalibrationWindow(QtWidgets.QWidget):
         # Keep cursor visible for assistant to click buttons
         self.setCursor(QtCore.Qt.ArrowCursor)
         
+        print(f"[Calibration] Requested geometry: {screen_size.width()}x{screen_size.height()}")
+        print(f"[Calibration] Actual geometry after setGeometry: {self.width()}x{self.height()}")
+        
         # Create controls
         self._create_controls()
         
         # Connect internal signals (must be in main thread)
         self.progressToNext.connect(self._next_point, QtCore.Qt.QueuedConnection)
         
-        # Start calibration
+        # DON'T start calibration here - wait for finalize_after_show()
+    
+    def finalize_after_show(self):
+        """Finalize calibration setup after window is shown (regenerate grid if needed)."""
+        # Check if actual window size matches expected
+        actual_w, actual_h = self.width(), self.height()
+        expected_w, expected_h = self.screen_size.width(), self.screen_size.height()
+        
+        print(f"[Calibration] After show - Expected: {expected_w}x{expected_h}, Actual: {actual_w}x{actual_h}")
+        
+        if actual_w != expected_w or actual_h != expected_h:
+            print(f"[Calibration] Size mismatch! Regenerating grid with actual window size")
+            self.screen_size = QtCore.QSize(actual_w, actual_h)
+            self.grid_points = self._generate_grid_points()
+            self.remaining_points = list(self.grid_points)
+        
+        # Now start calibration with correct coordinates
         self._next_point()
         tts("Calibrating")
     
     def _generate_grid_points(self) -> List[Tuple[int, int]]:
-        """Generate grid of calibration points."""
+        """Generate grid of calibration points in LOGICAL coordinates (for Qt drawing)."""
         rows, cols = settings.CAL_GRID_CONFIGS[self.grid_size]
         w, h = self.screen_size.width(), self.screen_size.height()
         
@@ -445,12 +466,20 @@ class CalibrationWindow(QtWidgets.QWidget):
         for row in range(rows):
             for col in range(cols):
                 # Place points at edges and evenly spaced
-                x = int((col / (cols - 1)) * w) if cols > 1 else w // 2
-                y = int((row / (rows - 1)) * h) if rows > 1 else h // 2
+                # Use width-1 and height-1 since screen coordinates are 0-indexed
+                x = int((col / (cols - 1)) * (w - 1)) if cols > 1 else w // 2
+                y = int((row / (rows - 1)) * (h - 1)) if rows > 1 else h // 2
                 points.append((x, y))
         
-        print(f"[Calibration] Generated {len(points)} grid points: {points[:3]}...")
+        print(f"[Calibration] Generated {len(points)} grid points (logical): {points[:3]}...")
         return points
+    
+    def _logical_to_physical(self, logical_point: Tuple[int, int]) -> Tuple[int, int]:
+        """Convert logical Qt coordinates to physical screen/mouse coordinates."""
+        x, y = logical_point
+        physical_x = int(x * self.device_pixel_ratio)
+        physical_y = int(y * self.device_pixel_ratio)
+        return (physical_x, physical_y)
     
     def _create_controls(self):
         """Create control buttons."""
@@ -511,7 +540,8 @@ class CalibrationWindow(QtWidgets.QWidget):
         """Select and display next calibration point (sequential for MVP)."""
         # Announce previous point's sample count if any
         if self.current_point is not None:
-            count = self.cal_data.get_sample_count(self.current_point)
+            physical_point = self._logical_to_physical(self.current_point)
+            count = self.cal_data.get_sample_count(physical_point)
             if count > 0:
                 tts(f"{count}")  # Just say the number
         
@@ -636,12 +666,15 @@ class CalibrationWindow(QtWidgets.QWidget):
         """Finish auto-collection and add samples."""
         self.auto_collecting = False
         
-        # Add all collected samples
+        # Convert logical point to physical coordinates for storage
+        physical_point = self._logical_to_physical(self.current_point)
+        
+        # Add all collected samples with physical coordinates
         for sample in self.auto_collect_samples:
-            self.cal_data.add_sample(self.current_point, sample)
+            self.cal_data.add_sample(physical_point, sample)
         
         count = len(self.auto_collect_samples)
-        print(f"[Calibration] Auto-collect finished: {count} samples")
+        print(f"[Calibration] Auto-collect finished: {count} samples at logical {self.current_point} -> physical {physical_point}")
         
         self.auto_collect_samples = []
         
@@ -654,11 +687,12 @@ class CalibrationWindow(QtWidgets.QWidget):
         if self.current_point is None:
             return
         
-        # Collect sample
+        # Collect sample with physical coordinates
         if hasattr(self, 'current_gaze_data') and self.current_gaze_data:
-            self.cal_data.add_sample(self.current_point, self.current_gaze_data)
+            physical_point = self._logical_to_physical(self.current_point)
+            self.cal_data.add_sample(physical_point, self.current_gaze_data)
             # No TTS - keep it silent and fast
-            print(f"[Calibration] Accepted point {self.current_point}, samples: {self.cal_data.get_sample_count(self.current_point)}")
+            print(f"[Calibration] Accepted point logical {self.current_point} -> physical {physical_point}, samples: {self.cal_data.get_sample_count(physical_point)}")
         
         # Move to next point immediately
         self._next_point()
@@ -666,9 +700,11 @@ class CalibrationWindow(QtWidgets.QWidget):
     @QtCore.Slot()
     def undo_point(self):
         """Undo last sample."""
-        if self.current_point and self.cal_data.remove_last_sample(self.current_point):
-            # No TTS - keep it silent
-            self.update()
+        if self.current_point:
+            physical_point = self._logical_to_physical(self.current_point)
+            if self.cal_data.remove_last_sample(physical_point):
+                # No TTS - keep it silent
+                self.update()
     
     @QtCore.Slot()
     def toggle_opacity(self):
@@ -735,7 +771,9 @@ class CalibrationWindow(QtWidgets.QWidget):
         
         # Draw all calibration points
         for point in self.grid_points:
-            sample_count = self.cal_data.get_sample_count(point)
+            # Convert logical to physical to get sample count
+            physical_point = self._logical_to_physical(point)
+            sample_count = self.cal_data.get_sample_count(physical_point)
             
             if point == self.current_point:
                 color = settings.CAL_TARGET_ACTIVE
