@@ -21,6 +21,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
+import yaml  # For settings save/load
+
 # Suppress TensorFlow logging
 import logging
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
@@ -112,7 +114,7 @@ CHEEKBONE_R = [34, 143, 116]
 CHEEKBONE_L = [254, 372, 345]
 FOREHEAD_TOP_R = 103
 FOREHEAD_TOP_L = 332
-CHIN_TIP_POINTS = [208, 428, 175]
+CHIN_TIP_POINTS = [208, 428, 175]  # Corrected chin tip points
 
 
 class VideoWorker(QtCore.QObject):
@@ -177,6 +179,13 @@ class VideoWorker(QtCore.QObject):
         self._left_eye_enabled = True
         self._right_eye_enabled = True
         self._eye_enable_lock = QtCore.QMutex()
+        
+        # Gaze bounds tracking (for visualization and debugging)
+        self._gaze_min_x = None
+        self._gaze_max_x = None
+        self._gaze_min_y = None
+        self._gaze_max_y = None
+        self._gaze_bounds_lock = QtCore.QMutex()
 
         # Mediapipe face mesh setup
         mp_face_mesh = mp.solutions.face_mesh
@@ -231,6 +240,16 @@ class VideoWorker(QtCore.QObject):
         with QtCore.QMutexLocker(self._eye_enable_lock):
             self._right_eye_enabled = bool(enabled)
             print(f"[Worker] Right eye {'enabled' if enabled else 'disabled'}")
+    
+    @QtCore.Slot()
+    def reset_gaze_bounds(self):
+        """Reset gaze bounds tracking."""
+        with QtCore.QMutexLocker(self._gaze_bounds_lock):
+            self._gaze_min_x = None
+            self._gaze_max_x = None
+            self._gaze_min_y = None
+            self._gaze_max_y = None
+            print("[Worker] Gaze bounds reset")
 
     # ---- Slots for landmark filter parameters ----
 
@@ -799,7 +818,7 @@ class VideoWorker(QtCore.QObject):
                 cv2.putText(
                     img,
                     label,
-                    (end_pt[0] + 5, end_pt[1]-20),
+                    (end_pt[0] + 5, end_pt[1]),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.4,
                     color,
@@ -844,7 +863,7 @@ class VideoWorker(QtCore.QObject):
             cv2.circle(img, end_pt, vector_end_size, COLOR_GAZE_AVG, -1)
             cv2.putText(
                 img,
-                f"avg {avg_dir[0]:+.2f},{avg_dir[1]:+.2f}",
+                f"avg [{avg_dir[0]:+.3f}, {avg_dir[1]:+.3f}]",
                 (end_pt[0] + 5, end_pt[1]),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.4,
@@ -852,6 +871,42 @@ class VideoWorker(QtCore.QObject):
                 1,
                 cv2.LINE_AA,
             )
+            
+            # Track persistent max gaze bounds
+            with QtCore.QMutexLocker(self._gaze_bounds_lock):
+                if self._gaze_min_x is None:
+                    self._gaze_min_x = avg_dir[0]
+                    self._gaze_max_x = avg_dir[0]
+                    self._gaze_min_y = avg_dir[1]
+                    self._gaze_max_y = avg_dir[1]
+                else:
+                    self._gaze_min_x = min(self._gaze_min_x, avg_dir[0])
+                    self._gaze_max_x = max(self._gaze_max_x, avg_dir[0])
+                    self._gaze_min_y = min(self._gaze_min_y, avg_dir[1])
+                    self._gaze_max_y = max(self._gaze_max_y, avg_dir[1])
+                
+                # Draw bounding box if we have data
+                if self._gaze_min_x is not None:
+                    box_x, box_y = 10, 10
+                    box_w, box_h = 220, 80
+                    
+                    # Draw opaque black background
+                    cv2.rectangle(img, (box_x, box_y), (box_x + box_w, box_y + box_h), 
+                                (0, 0, 0), -1)
+                    
+                    # Yellow border
+                    cv2.rectangle(img, (box_x, box_y), (box_x + box_w, box_y + box_h), 
+                                COLOR_GAZE_AVG, 2)
+                    
+                    # White text (fully opaque, readable)
+                    cv2.putText(img, "avgxy bounds:", (box_x + 5, box_y + 20),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.putText(img, f"x: [{self._gaze_min_x:+.3f}, {self._gaze_max_x:+.3f}]", 
+                              (box_x + 5, box_y + 45),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.putText(img, f"y: [{self._gaze_min_y:+.3f}, {self._gaze_max_y:+.3f}]", 
+                              (box_x + 5, box_y + 65),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
         # New face orientation calculation
         # Method 1: Cheekbone-to-nose vector
@@ -896,34 +951,34 @@ class VideoWorker(QtCore.QObject):
         if self._show_landmarks_used:
             darker_face_color = tuple(int(c * DEF_LM_SPECIAL_BRIGHTNESS) for c in COLOR_FACE_AIM)
             
-            # Cheekbone points
+            # Cheekbone points - use FILTERED
             for idx in CHEEKBONE_R + CHEEKBONE_L:
-                p = face_landmarks.landmark[idx]
-                x, y = int(p.x * w), int(p.y * h)
+                filt = lm(idx)
+                x, y = int(filt[0] * w), int(filt[1] * h)
                 cv2.circle(overlay, (x, y), lm_special_size, darker_face_color, -1)
             
-            # Nose tip points
+            # Nose tip points - use FILTERED
             for idx in NOSE_TIP_POINTS:
-                p = face_landmarks.landmark[idx]
-                x, y = int(p.x * w), int(p.y * h)
+                filt = lm(idx)
+                x, y = int(filt[0] * w), int(filt[1] * h)
                 cv2.circle(overlay, (x, y), lm_special_size, darker_face_color, -1)
             
-            # Forehead points
+            # Forehead points - use FILTERED
             for idx in [FOREHEAD_TOP_R, FOREHEAD_TOP_L]:
-                p = face_landmarks.landmark[idx]
-                x, y = int(p.x * w), int(p.y * h)
+                filt = lm(idx)
+                x, y = int(filt[0] * w), int(filt[1] * h)
                 cv2.circle(overlay, (x, y), lm_special_size, darker_face_color, -1)
             
-            # Chin points
+            # Chin points - use FILTERED
             for idx in CHIN_TIP_POINTS:
-                p = face_landmarks.landmark[idx]
-                x, y = int(p.x * w), int(p.y * h)
+                filt = lm(idx)
+                x, y = int(filt[0] * w), int(filt[1] * h)
                 cv2.circle(overlay, (x, y), lm_special_size, darker_face_color, -1)
             
-            # Old eye corner landmarks (for reference/reminder)
+            # Old eye corner landmarks (for reference/reminder) - use FILTERED
             for idx in RIGHT_EYE_CORNERS + LEFT_EYE_CORNERS:
-                p = face_landmarks.landmark[idx]
-                x, y = int(p.x * w), int(p.y * h)
+                filt = lm(idx)
+                x, y = int(filt[0] * w), int(filt[1] * h)
                 cv2.circle(overlay, (x, y), lm_special_size, darker_face_color, -1)
             
             # Blend this overlay update
@@ -1153,6 +1208,9 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Setup global keyboard shortcuts
         self._setup_shortcuts()
+        
+        # Load saved settings
+        self.load_settings()
 
         self.thread.start()
 
@@ -1446,6 +1504,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Save/Reset buttons
         buttons_layout = QtWidgets.QHBoxLayout()
         
+        self.reset_gaze_btn = QtWidgets.QPushButton("Reset Gaze")
+        self.reset_gaze_btn.clicked.connect(self.reset_gaze_bounds)
+        buttons_layout.addWidget(self.reset_gaze_btn)
+        
+        self.save_stats_btn = QtWidgets.QPushButton("Save Stats")
+        self.save_stats_btn.clicked.connect(self.save_stats)
+        buttons_layout.addWidget(self.save_stats_btn)
+        
         self.reset_btn = QtWidgets.QPushButton("Reset to Defaults")
         self.reset_btn.clicked.connect(self.reset_to_defaults)
         buttons_layout.addWidget(self.reset_btn)
@@ -1488,6 +1554,45 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_worker_error(self, msg: str):
         self.status.showMessage(msg)
 
+    def reset_gaze_bounds(self):
+        """Reset gaze bounds tracking."""
+        self.worker.reset_gaze_bounds()
+        self.status.showMessage("Gaze bounds reset", 2000)
+
+    def save_stats(self):
+        """Save gaze statistics to YAML file."""
+        # Get current bounds from worker
+        with QtCore.QMutexLocker(self.worker._gaze_bounds_lock):
+            if self.worker._gaze_min_x is None:
+                self.status.showMessage("No gaze data to save yet", 3000)
+                return
+            
+            stats = {
+                'timestamp': datetime.now().isoformat(),
+                'gaze_bounds': {
+                    'x_min': float(self.worker._gaze_min_x),
+                    'x_max': float(self.worker._gaze_max_x),
+                    'y_min': float(self.worker._gaze_min_y),
+                    'y_max': float(self.worker._gaze_max_y),
+                    'x_range': float(self.worker._gaze_max_x - self.worker._gaze_min_x),
+                    'y_range': float(self.worker._gaze_max_y - self.worker._gaze_min_y),
+                }
+            }
+        
+        # Save to stats.yaml in config dir (parent of CAL_PRESETS_DIR)
+        config_dir = app_settings.CAL_PRESETS_DIR.parent
+        config_dir.mkdir(parents=True, exist_ok=True)
+        stats_file = config_dir / 'stats.yaml'
+        try:
+            with open(stats_file, 'w') as f:
+                yaml.dump(stats, f, default_flow_style=False)
+            print(f"[UI] Saved stats to {stats_file}")
+            print(f"[UI] Gaze bounds: x=[{stats['gaze_bounds']['x_min']:.3f}, {stats['gaze_bounds']['x_max']:.3f}], y=[{stats['gaze_bounds']['y_min']:.3f}, {stats['gaze_bounds']['y_max']:.3f}]")
+            self.status.showMessage(f"Stats saved to {stats_file.name}", 3000)
+        except Exception as e:
+            print(f"[UI] Error saving stats: {e}")
+            self.status.showMessage(f"Error saving stats: {e}", 5000)
+
     def reset_to_defaults(self):
         """Reset all controls to default values."""
         # Image adjustments
@@ -1502,17 +1607,64 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.showMessage("Reset to defaults", 2000)
 
     def save_settings(self):
-        """Save current settings to config file (placeholder for now)."""
-        # TODO: Implement YAML config save
+        """Save current settings to config file."""
         config = {
             'brightness': self.brightness_slider.value(),
             'contrast': self.contrast_slider.value() / 100.0,
             'filter_enabled': self.filter_enabled_cb.isChecked(),
             'median_window': self.median_window_slider.value(),
             'ema_alpha': self.ema_alpha_slider.value() / 100.0,
+            'left_eye_enabled': self.left_eye_cb.isChecked(),
+            'right_eye_enabled': self.right_eye_cb.isChecked(),
         }
-        print(f"[UI] Would save config: {config}")
-        self.status.showMessage("Settings saved (not yet implemented)", 2000)
+        
+        # Save to settings.yaml in config dir (parent of CAL_PRESETS_DIR)
+        config_dir = app_settings.CAL_PRESETS_DIR.parent
+        config_dir.mkdir(parents=True, exist_ok=True)
+        settings_file = config_dir / 'settings.yaml'
+        try:
+            with open(settings_file, 'w') as f:
+                yaml.dump(config, f, default_flow_style=False)
+            print(f"[UI] Saved settings to {settings_file}")
+            self.status.showMessage(f"Settings saved to {settings_file.name}", 3000)
+        except Exception as e:
+            print(f"[UI] Error saving settings: {e}")
+            self.status.showMessage(f"Error saving: {e}", 5000)
+    
+    def load_settings(self):
+        """Load settings from config file."""
+        config_dir = app_settings.CAL_PRESETS_DIR.parent
+        settings_file = config_dir / 'settings.yaml'
+        if not settings_file.exists():
+            return
+        
+        try:
+            with open(settings_file, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            if not config:
+                return
+            
+            # Apply loaded settings
+            if 'brightness' in config:
+                self.brightness_slider.setValue(config['brightness'])
+            if 'contrast' in config:
+                self.contrast_slider.setValue(int(config['contrast'] * 100))
+            if 'filter_enabled' in config:
+                self.filter_enabled_cb.setChecked(config['filter_enabled'])
+            if 'median_window' in config:
+                self.median_window_slider.setValue(config['median_window'])
+            if 'ema_alpha' in config:
+                self.ema_alpha_slider.setValue(int(config['ema_alpha'] * 100))
+            if 'left_eye_enabled' in config:
+                self.left_eye_cb.setChecked(config['left_eye_enabled'])
+            if 'right_eye_enabled' in config:
+                self.right_eye_cb.setChecked(config['right_eye_enabled'])
+            
+            print(f"[UI] Loaded settings from {settings_file}")
+            self.status.showMessage("Settings loaded", 2000)
+        except Exception as e:
+            print(f"[UI] Error loading settings: {e}")
 
     def start_calibration(self):
         """Start calibration process."""
