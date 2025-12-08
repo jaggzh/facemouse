@@ -394,7 +394,7 @@ class CalibrationWindow(QtWidgets.QWidget):
     progressToNext = QtCore.Signal()  # Signal to move to next point (from worker thread)
     
     def __init__(self, screen_size: QtCore.QSize, grid_size: int = settings.DEF_CAL_GRID_SIZE, 
-                 active_preset: CalibrationData = None, cal_auto_collect_s: float = 3.0, parent=None):
+                 active_preset: CalibrationData = None, cal_auto_collect_s: float = 2.0, parent=None):
         super().__init__(parent)
         self.screen_size = screen_size
         self.grid_size = grid_size

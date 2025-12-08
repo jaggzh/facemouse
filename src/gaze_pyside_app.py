@@ -51,8 +51,8 @@ DEF_VFILE_LOOP = True  # Loop video files by default
 
 # Landmark filtering defaults
 DEF_FILTER_ENABLED = True
-DEF_MEDIAN_WINDOW = 3  # Number of samples for median filter
-DEF_EMA_ALPHA = 0.3  # Exponential moving average (0=very smooth, 1=no smoothing)
+DEF_MEDIAN_WINDOW = 7  # Number of samples for median filter
+DEF_EMA_ALPHA = 0.09  # Exponential moving average (0=very smooth, 1=no smoothing)
 
 # Image adjustment defaults
 DEF_BRIGHTNESS = 0  # -100 to 100
@@ -153,18 +153,33 @@ class VideoWorker(QtCore.QObject):
         self._contrast_lock = QtCore.QMutex()
         self._brightness_lock = QtCore.QMutex()
 
-        # Landmark filtering - only filter landmarks we actually use
+        # Landmark filtering - separate filters for different groups
         self._used_landmark_indices = set(
             LEFT_IRIS + [LEFT_PUPIL] + LEFT_EYE_CORNERS + LEFT_EYE_LIDS +
             RIGHT_IRIS + [RIGHT_PUPIL] + RIGHT_EYE_CORNERS + RIGHT_EYE_LIDS +
             NOSE_TIP_POINTS + CHEEKBONE_R + CHEEKBONE_L + 
             [FOREHEAD_TOP_R, FOREHEAD_TOP_L] + CHIN_TIP_POINTS
         )
-        self._landmark_filter = filters.LandmarkFilterSet(
-            median_window=DEF_MEDIAN_WINDOW,
-            ema_alpha=DEF_EMA_ALPHA,
-            enabled=DEF_FILTER_ENABLED
-        )
+        
+        # Separate filter groups for different landmark types
+        self._filter_groups = {
+            'iris_pupil': filters.LandmarkFilterSet(DEF_MEDIAN_WINDOW, DEF_EMA_ALPHA, DEF_FILTER_ENABLED),
+            'eye_corners': filters.LandmarkFilterSet(DEF_MEDIAN_WINDOW, DEF_EMA_ALPHA, DEF_FILTER_ENABLED),
+            'eye_lids': filters.LandmarkFilterSet(DEF_MEDIAN_WINDOW, DEF_EMA_ALPHA, DEF_FILTER_ENABLED),
+            'face_orientation': filters.LandmarkFilterSet(DEF_MEDIAN_WINDOW, DEF_EMA_ALPHA, DEF_FILTER_ENABLED),
+        }
+        
+        # Map landmark indices to filter groups
+        self._landmark_to_group = {}
+        for idx in LEFT_IRIS + RIGHT_IRIS + [LEFT_PUPIL, RIGHT_PUPIL]:
+            self._landmark_to_group[idx] = 'iris_pupil'
+        for idx in LEFT_EYE_CORNERS + RIGHT_EYE_CORNERS:
+            self._landmark_to_group[idx] = 'eye_corners'
+        for idx in LEFT_EYE_LIDS + RIGHT_EYE_LIDS:
+            self._landmark_to_group[idx] = 'eye_lids'
+        for idx in NOSE_TIP_POINTS + CHEEKBONE_R + CHEEKBONE_L + [FOREHEAD_TOP_R, FOREHEAD_TOP_L] + CHIN_TIP_POINTS:
+            self._landmark_to_group[idx] = 'face_orientation'
+        
         self._filter_lock = QtCore.QMutex()
 
         # Eye open ratio threshold (height / width) for blink / eye-closed detection
@@ -250,27 +265,34 @@ class VideoWorker(QtCore.QObject):
             self._gaze_min_y = None
             self._gaze_max_y = None
             print("[Worker] Gaze bounds reset")
+    
+    @QtCore.Slot(str, int)
+    def set_filter_median_window(self, group: str, value: int):
+        """Set median window for a filter group."""
+        with QtCore.QMutexLocker(self._filter_lock):
+            if group in self._filter_groups:
+                self._filter_groups[group].median_window = value
+                print(f"[Worker] {group} median window: {value}")
+    
+    @QtCore.Slot(str, float)
+    def set_filter_ema_alpha(self, group: str, value: float):
+        """Set EMA alpha for a filter group."""
+        with QtCore.QMutexLocker(self._filter_lock):
+            if group in self._filter_groups:
+                self._filter_groups[group].ema_alpha = value
+                print(f"[Worker] {group} EMA alpha: {value}")
+    
+    @QtCore.Slot(str, bool)
+    def set_filter_enabled(self, group: str, enabled: bool):
+        """Set filter enabled for a filter group."""
+        with QtCore.QMutexLocker(self._filter_lock):
+            if group in self._filter_groups:
+                self._filter_groups[group].enabled = enabled
+                print(f"[Worker] {group} filtering {'enabled' if enabled else 'disabled'}")
 
     # ---- Slots for landmark filter parameters ----
 
     @QtCore.Slot(bool)
-    def set_filter_enabled(self, enabled: bool):
-        with QtCore.QMutexLocker(self._filter_lock):
-            self._landmark_filter.set_parameters(enabled=enabled)
-            print(f"[Worker] Filtering {'enabled' if enabled else 'disabled'}")
-
-    @QtCore.Slot(int)
-    def set_median_window(self, value: int):
-        with QtCore.QMutexLocker(self._filter_lock):
-            self._landmark_filter.set_parameters(median_window=value)
-            print(f"[Worker] Median window set to {value}")
-
-    @QtCore.Slot(float)
-    def set_ema_alpha(self, value: float):
-        with QtCore.QMutexLocker(self._filter_lock):
-            self._landmark_filter.set_parameters(ema_alpha=value)
-            print(f"[Worker] EMA alpha set to {value:.3f}")
-
     # ---- Video playback control slots ----
 
     @QtCore.Slot()
@@ -660,14 +682,15 @@ class VideoWorker(QtCore.QObject):
         vector_end_size = max(1, int(DEF_VECTOR_END_SIZE * base_lm_scaler))
 
         def lm(idx: int):
-            """Get filtered landmark position (only filters landmarks we use)."""
+            """Get filtered landmark position (uses appropriate filter group per landmark type)."""
             p = face_landmarks.landmark[idx]
             raw_point = np.array([p.x, p.y, p.z], dtype=np.float32)
             
             # Only filter landmarks we actually use
             if idx in self._used_landmark_indices:
+                group_name = self._landmark_to_group.get(idx, 'face_orientation')
                 with QtCore.QMutexLocker(self._filter_lock):
-                    filtered_point = self._landmark_filter.update(idx, raw_point)
+                    filtered_point = self._filter_groups[group_name].update(idx, raw_point)
                 return filtered_point
             else:
                 # Not used, return raw
@@ -739,6 +762,67 @@ class VideoWorker(QtCore.QObject):
 
         left = eye_info(LEFT_IRIS, LEFT_PUPIL, LEFT_EYE_CORNERS, LEFT_EYE_LIDS)
         right = eye_info(RIGHT_IRIS, RIGHT_PUPIL, RIGHT_EYE_CORNERS, RIGHT_EYE_LIDS)
+        
+        # ==== HEAD COORDINATE SYSTEM & GAZE TRANSFORMATION ====
+        # Calculate head X-axis rotation from two sources and average
+        # This compensates for camera angle and head tilt
+        
+        # 1. Eye corners axis: left outer -> right outer
+        left_outer_pos = lm_avg(LEFT_EYE_CORNERS_OUTER)
+        right_outer_pos = lm_avg(RIGHT_EYE_CORNERS_OUTER)
+        eye_axis = right_outer_pos - left_outer_pos  # Left to right
+        eye_axis_2d = eye_axis[:2]  # Just x, y
+        eye_angle = np.arctan2(eye_axis_2d[1], eye_axis_2d[0])
+        
+        # 2. Forehead axis: left -> right  
+        forehead_left = lm(FOREHEAD_TOP_L)
+        forehead_right = lm(FOREHEAD_TOP_R)
+        forehead_axis = forehead_right - forehead_left
+        forehead_axis_2d = forehead_axis[:2]
+        forehead_angle = np.arctan2(forehead_axis_2d[1], forehead_axis_2d[0])
+        
+        # Average the two angles for final head X-axis rotation
+        head_angle = (eye_angle + forehead_angle) / 2.0
+        
+        # Rotation matrix to transform vectors into head-aligned coordinates
+        cos_a = np.cos(-head_angle)  # Negative to rotate back to aligned
+        sin_a = np.sin(-head_angle)
+        rotation_matrix = np.array([[cos_a, -sin_a],
+                                   [sin_a, cos_a]])
+        
+        # Calculate face-aim vector (we'll subtract this later)
+        # Need to compute it now before using it
+        nose_tip_point = lm_avg(NOSE_TIP_POINTS)
+        cheek_avg = lm_avg(CHEEKBONE_R + CHEEKBONE_L)
+        vector_cheeks_nose = nose_tip_point - cheek_avg
+        vector_cheeks_nose = vector_cheeks_nose / (np.linalg.norm(vector_cheeks_nose) + 1e-6)
+        
+        forehead_l = lm(FOREHEAD_TOP_L)
+        forehead_r = lm(FOREHEAD_TOP_R)
+        chin_tip = lm_avg(CHIN_TIP_POINTS)
+        v1 = chin_tip - forehead_l
+        v2 = chin_tip - forehead_r
+        vector_face_normal = np.cross(v1, v2)
+        if vector_face_normal[2] > 0:
+            vector_face_normal = -vector_face_normal
+        vector_face_normal = vector_face_normal / (np.linalg.norm(vector_face_normal) + 1e-6)
+        
+        final_face_vector = 0.5 * (vector_cheeks_nose + vector_face_normal)
+        final_face_vector = final_face_vector / (np.linalg.norm(final_face_vector) + 1e-6)
+        face_dir_prelim = np.array([final_face_vector[0], final_face_vector[1]], dtype=np.float32)
+        
+        # Transform each eye's gaze: rotate to head space, then subtract face-aim
+        def transform_gaze(gaze_2d):
+            """Transform gaze into head-aligned coordinates and subtract face-aim."""
+            # Rotate to head-aligned coordinates
+            rotated = rotation_matrix @ gaze_2d
+            # Subtract face-aim to get relative gaze (compensates for head orientation)
+            corrected = rotated - face_dir_prelim
+            return corrected
+        
+        # Apply transformation to eye gaze vectors (modifies in place)
+        left["dir_norm"] = transform_gaze(left["dir_norm"])
+        right["dir_norm"] = transform_gaze(right["dir_norm"])
         
         # Check which eyes are enabled
         with QtCore.QMutexLocker(self._eye_enable_lock):
@@ -908,35 +992,10 @@ class VideoWorker(QtCore.QObject):
                               (box_x + 5, box_y + 65),
                               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # New face orientation calculation
-        # Method 1: Cheekbone-to-nose vector
-        cheekbone_r = lm_avg(CHEEKBONE_R)
-        cheekbone_l = lm_avg(CHEEKBONE_L)
-        cheekbone_center = 0.5 * (cheekbone_r + cheekbone_l)
-        nose_tip_point = lm_avg(NOSE_TIP_POINTS)
-        
-        vector_cheeks_nose = nose_tip_point - cheekbone_center
-        vector_cheeks_nose = vector_cheeks_nose / (np.linalg.norm(vector_cheeks_nose) + 1e-6)
-        
-        # Method 2: Forehead-chin plane normal
-        forehead_r = lm(FOREHEAD_TOP_R)
-        forehead_l = lm(FOREHEAD_TOP_L)
-        chin_tip = lm_avg(CHIN_TIP_POINTS)
-        
-        v1 = forehead_l - forehead_r
-        v2 = chin_tip - forehead_r
-        vector_face_normal = np.cross(v1, v2)
-        # Flip if needed so it points roughly forward (negative z)
-        if vector_face_normal[2] > 0:
-            vector_face_normal = -vector_face_normal
-        vector_face_normal = vector_face_normal / (np.linalg.norm(vector_face_normal) + 1e-6)
-        
-        # Combine both methods
-        final_face_vector = 0.5 * (vector_cheeks_nose + vector_face_normal)
-        final_face_vector = final_face_vector / (np.linalg.norm(final_face_vector) + 1e-6)
-        
-        # Use x,y components as 2D direction for display
-        face_dir = np.array([final_face_vector[0], final_face_vector[1]], dtype=np.float32)
+        # Face direction already computed during gaze transformation
+        # Just get it for display purposes
+        nose_tip_point = lm_avg(NOSE_TIP_POINTS)  # For drawing origin point
+        face_dir = face_dir_prelim  # Already computed above
         
         nx, ny = int(nose_tip_point[0] * w), int(nose_tip_point[1] * h)
         face_end = (
@@ -1133,6 +1192,135 @@ class HotkeyHelpWidget(QtWidgets.QWidget):
             y_offset += line_height
 
 
+
+
+class FiltersDialog(QtWidgets.QDialog):
+    """Popup dialog for configuring filters for each landmark group."""
+    
+    def __init__(self, worker, parent=None):
+        super().__init__(parent)
+        self.worker = worker
+        self.setWindowTitle("Filter Settings")
+        self.setModal(False)  # Non-modal so user can see main window
+        
+        layout = QtWidgets.QVBoxLayout(self)
+        
+        # Create filter controls for each group
+        self.filter_groups = ['iris_pupil', 'eye_corners', 'eye_lids', 'face_orientation']
+        self.group_labels = {
+            'iris_pupil': 'Iris/Pupil',
+            'eye_corners': 'Eye Corners',
+            'eye_lids': 'Eye Lids',
+            'face_orientation': 'Face Orientation'
+        }
+        
+        # Store widget references for each group
+        self.enable_cbs = {}
+        self.median_sliders = {}
+        self.median_spins = {}
+        self.ema_sliders = {}
+        self.ema_spins = {}
+        
+        for group in self.filter_groups:
+            group_box = QtWidgets.QGroupBox(self.group_labels[group])
+            group_layout = QtWidgets.QFormLayout()
+            
+            # Enable checkbox
+            enable_cb = QtWidgets.QCheckBox("Enable filtering")
+            enable_cb.setChecked(DEF_FILTER_ENABLED)
+            enable_cb.toggled.connect(
+                lambda checked, g=group: self.worker.set_filter_enabled(g, checked))
+            group_layout.addRow(enable_cb)
+            self.enable_cbs[group] = enable_cb
+            
+            # Median window
+            median_layout = QtWidgets.QHBoxLayout()
+            median_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            median_slider.setRange(1, 21)
+            median_slider.setValue(DEF_MEDIAN_WINDOW)
+            median_spin = QtWidgets.QSpinBox()
+            median_spin.setRange(1, 21)
+            median_spin.setValue(DEF_MEDIAN_WINDOW)
+            # Capture references properly
+            median_slider.valueChanged.connect(
+                lambda val, spin=median_spin: spin.setValue(val))
+            median_spin.valueChanged.connect(
+                lambda val, slider=median_slider: slider.setValue(val))
+            median_slider.valueChanged.connect(
+                lambda val, g=group: self.worker.set_filter_median_window(g, val))
+            median_layout.addWidget(median_slider)
+            median_layout.addWidget(median_spin)
+            group_layout.addRow("Median window:", median_layout)
+            self.median_sliders[group] = median_slider
+            self.median_spins[group] = median_spin
+            
+            # EMA alpha (smoothing)
+            ema_layout = QtWidgets.QHBoxLayout()
+            ema_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            ema_slider.setRange(1, 100)
+            ema_slider.setValue(int(DEF_EMA_ALPHA * 100))
+            ema_spin = QtWidgets.QDoubleSpinBox()
+            ema_spin.setRange(0.01, 1.0)
+            ema_spin.setSingleStep(0.01)
+            ema_spin.setDecimals(2)
+            ema_spin.setValue(DEF_EMA_ALPHA)
+            # Capture references properly
+            ema_slider.valueChanged.connect(
+                lambda val, spin=ema_spin: spin.setValue(val / 100.0))
+            ema_spin.valueChanged.connect(
+                lambda val, slider=ema_slider: slider.setValue(int(val * 100)))
+            ema_slider.valueChanged.connect(
+                lambda val, g=group: self.worker.set_filter_ema_alpha(g, val / 100.0))
+            ema_layout.addWidget(ema_slider)
+            ema_layout.addWidget(ema_spin)
+            group_layout.addRow("Smoothing (EMA α):", ema_layout)
+            self.ema_sliders[group] = ema_slider
+            self.ema_spins[group] = ema_spin
+            
+            group_box.setLayout(group_layout)
+            layout.addWidget(group_box)
+        
+        # Close button
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+        
+        self.resize(400, 600)
+        
+        # Trigger initial values to worker
+        self.apply_current_values()
+    
+    def apply_current_values(self):
+        """Apply current UI values to worker (for initialization or after loading)."""
+        for group in self.filter_groups:
+            self.worker.set_filter_enabled(group, self.enable_cbs[group].isChecked())
+            self.worker.set_filter_median_window(group, self.median_spins[group].value())
+            self.worker.set_filter_ema_alpha(group, self.ema_spins[group].value())
+    
+    def get_settings(self):
+        """Get current filter settings as dict."""
+        settings = {}
+        for group in self.filter_groups:
+            settings[group] = {
+                'enabled': self.enable_cbs[group].isChecked(),
+                'median_window': self.median_spins[group].value(),
+                'ema_alpha': self.ema_spins[group].value()
+            }
+        return settings
+    
+    def set_settings(self, settings):
+        """Apply settings dict to UI widgets."""
+        for group in self.filter_groups:
+            if group in settings:
+                s = settings[group]
+                if 'enabled' in s:
+                    self.enable_cbs[group].setChecked(s['enabled'])
+                if 'median_window' in s:
+                    self.median_spins[group].setValue(s['median_window'])
+                if 'ema_alpha' in s:
+                    self.ema_spins[group].setValue(s['ema_alpha'])
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, video_file=None, usb_device=None, dev_device=None,
                  frame_delay=DEF_VFILE_FRAME_DELAY,
@@ -1213,6 +1401,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.load_settings()
 
         self.thread.start()
+        
+        # Create filters dialog (but don't show it yet)
+        self.filters_dialog = None
+        self.saved_filter_settings = None
+    
+    def open_filters_dialog(self):
+        """Open the filters configuration dialog."""
+        if self.filters_dialog is None:
+            self.filters_dialog = FiltersDialog(self.worker, self)
+            # Apply saved settings if we have them
+            if self.saved_filter_settings is not None:
+                self.filters_dialog.set_settings(self.saved_filter_settings)
+                self.filters_dialog.apply_current_values()
+        self.filters_dialog.show()
+        self.filters_dialog.raise_()
+        self.filters_dialog.activateWindow()
 
     def _create_toolbar(self, is_video_file):
         self.toolbar = self.addToolBar("Main")
@@ -1443,61 +1647,10 @@ class MainWindow(QtWidgets.QMainWindow):
         
         filter_layout.addRow(eye_layout)
         
-        # Filter enable toggle
-        self.filter_enabled_cb = QtWidgets.QCheckBox("Enable filtering")
-        self.filter_enabled_cb.toggled.connect(
-            self.worker.set_filter_enabled, QtCore.Qt.DirectConnection)
-        filter_layout.addRow(self.filter_enabled_cb)
-        
-        # Median window size: 1..10
-        self.median_window_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.median_window_slider.setRange(1, 10)
-        self.median_window_spin = QtWidgets.QSpinBox()
-        self.median_window_spin.setRange(1, 10)
-        
-        # Sync slider and spinbox
-        self.median_window_slider.valueChanged.connect(self.median_window_spin.setValue)
-        self.median_window_spin.valueChanged.connect(self.median_window_slider.setValue)
-        
-        # Send to worker (DirectConnection since worker loop is blocking)
-        self.median_window_slider.valueChanged.connect(
-            self.worker.set_median_window, QtCore.Qt.DirectConnection)
-        
-        filter_layout.addRow("Median Window", self._hbox(self.median_window_slider, self.median_window_spin))
-        
-        # EMA alpha: 0.01..1.0 (mapped to slider 1..100)
-        self.ema_alpha_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.ema_alpha_slider.setRange(1, 100)
-        self.ema_alpha_spin = QtWidgets.QDoubleSpinBox()
-        self.ema_alpha_spin.setRange(0.01, 1.0)
-        self.ema_alpha_spin.setSingleStep(0.01)
-        
-        # Sync slider <-> spinbox
-        def on_ema_slider(val: int):
-            self.ema_alpha_spin.blockSignals(True)
-            self.ema_alpha_spin.setValue(val / 100.0)
-            self.ema_alpha_spin.blockSignals(False)
-        
-        def on_ema_spin(val: float):
-            slider_val = int(val * 100)
-            self.ema_alpha_slider.blockSignals(True)
-            self.ema_alpha_slider.setValue(slider_val)
-            self.ema_alpha_slider.blockSignals(False)
-        
-        self.ema_alpha_slider.valueChanged.connect(on_ema_slider)
-        self.ema_alpha_spin.valueChanged.connect(on_ema_spin)
-        
-        # Send to worker (DirectConnection since worker loop is blocking)
-        self.ema_alpha_spin.valueChanged.connect(
-            self.worker.set_ema_alpha, QtCore.Qt.DirectConnection)
-        
-        filter_layout.addRow("Smoothing (α)", self._hbox(self.ema_alpha_slider, self.ema_alpha_spin))
-        
-        # Add note about smoothing
-        note_label = QtWidgets.QLabel("Lower α = smoother, higher = more responsive")
-        note_label.setFont(QtGui.QFont("Sans", 8))
-        note_label.setWordWrap(True)
-        filter_layout.addRow(note_label)
+        # Filters button to open dialog
+        self.filters_btn = QtWidgets.QPushButton("Filters...")
+        self.filters_btn.clicked.connect(self.open_filters_dialog)
+        filter_layout.addRow(self.filters_btn)
         
         filter_group.setLayout(filter_layout)
         
@@ -1537,9 +1690,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # Trigger initial values to worker (after all connections are made)
         self.brightness_slider.setValue(DEF_BRIGHTNESS)
         self.contrast_slider.setValue(int(DEF_CONTRAST * 100))
-        self.filter_enabled_cb.setChecked(DEF_FILTER_ENABLED)
-        self.median_window_slider.setValue(DEF_MEDIAN_WINDOW)
-        self.ema_alpha_slider.setValue(int(DEF_EMA_ALPHA * 100))
 
     @staticmethod
     def _hbox(*widgets):
@@ -1599,11 +1749,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.brightness_slider.setValue(DEF_BRIGHTNESS)
         self.contrast_slider.setValue(int(DEF_CONTRAST * 100))
         
-        # Filters
-        self.filter_enabled_cb.setChecked(DEF_FILTER_ENABLED)
-        self.median_window_slider.setValue(DEF_MEDIAN_WINDOW)
-        self.ema_alpha_slider.setValue(int(DEF_EMA_ALPHA * 100))
-        
         self.status.showMessage("Reset to defaults", 2000)
 
     def save_settings(self):
@@ -1611,12 +1756,13 @@ class MainWindow(QtWidgets.QMainWindow):
         config = {
             'brightness': self.brightness_slider.value(),
             'contrast': self.contrast_slider.value() / 100.0,
-            'filter_enabled': self.filter_enabled_cb.isChecked(),
-            'median_window': self.median_window_slider.value(),
-            'ema_alpha': self.ema_alpha_slider.value() / 100.0,
             'left_eye_enabled': self.left_eye_cb.isChecked(),
             'right_eye_enabled': self.right_eye_cb.isChecked(),
         }
+        
+        # Add filter settings if dialog exists
+        if self.filters_dialog is not None:
+            config['filters'] = self.filters_dialog.get_settings()
         
         # Save to settings.yaml in config dir (parent of CAL_PRESETS_DIR)
         config_dir = app_settings.CAL_PRESETS_DIR.parent
@@ -1650,16 +1796,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.brightness_slider.setValue(config['brightness'])
             if 'contrast' in config:
                 self.contrast_slider.setValue(int(config['contrast'] * 100))
-            if 'filter_enabled' in config:
-                self.filter_enabled_cb.setChecked(config['filter_enabled'])
-            if 'median_window' in config:
-                self.median_window_slider.setValue(config['median_window'])
-            if 'ema_alpha' in config:
-                self.ema_alpha_slider.setValue(int(config['ema_alpha'] * 100))
             if 'left_eye_enabled' in config:
                 self.left_eye_cb.setChecked(config['left_eye_enabled'])
             if 'right_eye_enabled' in config:
                 self.right_eye_cb.setChecked(config['right_eye_enabled'])
+            
+            # Store filter settings to apply when dialog is created
+            if 'filters' in config:
+                self.saved_filter_settings = config['filters']
+            else:
+                self.saved_filter_settings = None
             
             print(f"[UI] Loaded settings from {settings_file}")
             self.status.showMessage("Settings loaded", 2000)
