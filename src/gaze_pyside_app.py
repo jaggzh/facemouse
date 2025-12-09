@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 # ============================================================================
 # Suppress verbose library output BEFORE imports
 # ============================================================================
@@ -34,7 +33,6 @@ import av  # pip install av
 import numpy as np
 import cv2
 import mediapipe as mp
-
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import camsettingsh264 as camsettings
@@ -42,7 +40,6 @@ import filters
 import calibration
 import settings as app_settings
 import mouse_control
-
 
 # ============================================================================
 # Configuration defaults
@@ -60,11 +57,9 @@ DEF_EMA_ALPHA = 0.09  # Exponential moving average (0=very smooth, 1=no smoothin
 DEF_BRIGHTNESS = 0  # -100 to 100
 DEF_CONTRAST = 1.0  # 0.5 to 2.0
 
-
 # ============================================================================
 # Visualization and processing constants
 # ============================================================================
-
 # Landmark sizes and scaling
 DEF_LM_SIZE = 1  # Size for "all landmarks"
 DEF_LM_SPECIAL_SCALE = 3  # Multiplier for special landmarks
@@ -91,17 +86,19 @@ ALPHA_LANDMARKS = 0.5
 GAZE_VECTOR_SCALE_PX = 120
 FACE_VECTOR_SCALE_PX = 140
 
-
 # Mediapipe face / eye landmark indices (canonical face mesh + iris)
 LEFT_IRIS = [474, 475, 476, 477] # outer, top, inner, bottom (clockwise)
 LEFT_PUPIL = 473
 RIGHT_IRIS = [469, 470, 471, 472] # inner, top, outer, bottom (counter-clockwise)
 RIGHT_PUPIL = 468
+
 # Expanded eye corners with adjacent points
 RIGHT_EYE_CORNERS = [133, 243, 189, 244, 33, 130] # Inner corners + adjacent, outer + adjacent
 LEFT_EYE_CORNERS = [362, 463, 413, 464, 263, 359] # Inner corners + adjacent, outer + adjacent
+
 LEFT_EYE_LIDS = [386, 374] # Top, bottom
 RIGHT_EYE_LIDS = [159, 145] # Top, bottom
+
 NOSE_TIP = 1
 
 # Split for separate coloring
@@ -141,11 +138,11 @@ def termplot(level: int, line: str):
     if _print_data_level >= level:
         print(line)
 
+
 class VideoWorker(QtCore.QObject):
     """Background worker: decodes H.264 or video file, applies pre-filter, runs Mediapipe,
     draws debug overlays, and emits annotated frames as NumPy arrays (BGR).
     """
-
     frameReady = QtCore.Signal(np.ndarray, int, int)  # frame, current_frame, total_frames
     gazeData = QtCore.Signal(np.ndarray, dict)  # frame, gaze_data dict
     error = QtCore.Signal(str)
@@ -206,7 +203,7 @@ class VideoWorker(QtCore.QObject):
             self._landmark_to_group[idx] = 'face_orientation'
         
         self._filter_lock = QtCore.QMutex()
-
+        
         # Eye open ratio threshold (height / width) for blink / eye-closed detection
         self._eye_open_thresh = 0.20
 
@@ -249,7 +246,6 @@ class VideoWorker(QtCore.QObject):
         )
 
     # ---- Slots for UI to tweak image pre-filter parameters ----
-
     @QtCore.Slot(int)
     def set_brightness(self, value: int):
         with QtCore.QMutexLocker(self._brightness_lock):
@@ -337,11 +333,7 @@ class VideoWorker(QtCore.QObject):
             else:
                 print("[Worker] Calibration corners cleared")
     
-    # ---- Slots for landmark filter parameters ----
-
-    @QtCore.Slot(bool)
     # ---- Video playback control slots ----
-
     @QtCore.Slot()
     def toggle_pause(self):
         print("[Worker] toggle_pause called")
@@ -374,11 +366,9 @@ class VideoWorker(QtCore.QObject):
             self._jump_to_end = True
 
     # ---- Core loop ----
-
     @QtCore.Slot()
     def start(self):
         self._running = True
-
         if self._video_file:
             # Process video file
             self._process_video_file()
@@ -388,7 +378,6 @@ class VideoWorker(QtCore.QObject):
         else:
             # Process TCP camera stream
             self._process_camera_stream()
-
         self.finished.emit()
         print("[Worker] Stopped")
 
@@ -480,12 +469,10 @@ class VideoWorker(QtCore.QObject):
                 else:
                     print("[Worker] Video finished")
                     break
-
             except Exception as e:
                 msg = f"Decode error: {e}"
                 print("[Worker]", msg)
                 self.error.emit(msg)
-
             finally:
                 try:
                     container.close()
@@ -647,13 +634,11 @@ class VideoWorker(QtCore.QObject):
                 continue
 
             print("[Worker] Stream opened, starting decode loop")
-
             frame_count = 0
             try:
                 for frame in container.decode(video=0):
                     if not self._running:
                         break
-
                     img = frame.to_ndarray(format="bgr24")
 
                     # Apply brightness/contrast adjustments
@@ -678,7 +663,6 @@ class VideoWorker(QtCore.QObject):
                 msg = f"Decode error or stream ended: {e}"
                 print("[Worker]", msg)
                 self.error.emit(msg)
-
             finally:
                 try:
                     container.close()
@@ -705,7 +689,6 @@ class VideoWorker(QtCore.QObject):
         self._running = False
 
     # ---- Gaze / blink / overlay helpers ----
-
     def _process_and_overlay(self, img: np.ndarray) -> np.ndarray:
         """Run Mediapipe, compute simple per-eye gaze offsets, detect blinks
         via eye openness ratio, and draw debug overlays.
@@ -923,7 +906,6 @@ class VideoWorker(QtCore.QObject):
             iris_center = info["iris_center"]
             cx, cy = int(iris_center[0] * w), int(iris_center[1] * h)
             vx, vy = info["dir_norm"]
-
             if is_open:
                 end_pt = (
                     int(cx + vx * GAZE_VECTOR_SCALE_PX),
@@ -933,7 +915,6 @@ class VideoWorker(QtCore.QObject):
                 cv2.line(img, (cx, cy), end_pt, color, 2, cv2.LINE_AA)
                 # distal dot
                 cv2.circle(img, end_pt, vector_end_size, color, -1)
-
                 # Text overlay with gaze values and eye open ratio
                 label = f"[{vx:+.3f}, {vy:+.3f}] ({info['open_ratio']:.2f})"
                 cv2.putText(
@@ -1029,21 +1010,17 @@ class VideoWorker(QtCore.QObject):
             )
             
             # Output plot data at level 1
-            print(f"_print_data_level: {_print_data_level}")
             if _print_data_level >= 1:
                 parts = [f"PLOT:EYES.x:{avg_dir[0]:.4f} EYES.y:{avg_dir[1]:.4f}",
                         f"FACE.x:{face_dir_prelim[0]:.4f} FACE.y:{face_dir_prelim[1]:.4f}",
                         f"N_EYES:{len(open_dirs)}"]
                 
                 # Add corner calibration values as constant reference lines
-                print("GET mutex?")
                 with QtCore.QMutexLocker(self._cal_corners_lock):
-                    print(f"_cal_corners:{self._cal_corners}")
                     if self._cal_corners:
                         for name in ('tl', 'tr', 'bl', 'br'):
                             corner = self._cal_corners.get(name)
                             if corner and corner.get('gaze'):
-                                print(f"  corner:{corner}")
                                 gx, gy = corner['gaze']
                                 parts.append(f"C_{name}.x:{gx:.4f} C_{name}.y:{gy:.4f}")
                 
@@ -1177,7 +1154,6 @@ class VideoWidget(QtWidgets.QWidget):
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         painter = QtGui.QPainter(self)
         painter.fillRect(self.rect(), QtCore.Qt.black)
-
         if self._pixmap is not None:
             # scale to fit while keeping aspect ratio
             target = self._pixmap.scaled(
@@ -1195,7 +1171,6 @@ class VideoWidget(QtWidgets.QWidget):
                 painter.setFont(QtGui.QFont("Monospace", 10))
                 frame_text = f"Frame: {self._current_frame}/{self._total_frames}"
                 painter.drawText(10, self.height() - 10, frame_text)
-
         painter.end()
 
 
@@ -1283,8 +1258,6 @@ class HotkeyHelpWidget(QtWidgets.QWidget):
             text = f"{key:8s} {desc}"
             painter.drawText(10, y_offset, text)
             y_offset += line_height
-
-
 
 
 class FiltersDialog(QtWidgets.QDialog):
@@ -1438,6 +1411,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui_scale_nav = self.ui_scale_global * app_settings.DEF_UI_SCALE_MAIN_WINDOW * app_settings.DEF_UI_SCALE_NAV_BUTTONS
         self.ui_scale_panel = self.ui_scale_global * app_settings.DEF_UI_SCALE_MAIN_WINDOW * app_settings.DEF_UI_SCALE_CONTROL_PANEL
 
+        # Preset management lists (loaded from settings)
+        self.presets_order = []
+        self.presets_rank = []
+
         # Central video widget
         self.video_widget = VideoWidget(self)
         self.setCentralWidget(self.video_widget)
@@ -1583,6 +1560,29 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Add favorite presets as buttons
         self._refresh_preset_buttons()
+        
+        # Notice area (after preset buttons)
+        self.toolbar.addSeparator()
+        self.notice_label = QtWidgets.QLabel("")
+        self.notice_label.setMinimumWidth(200)
+        self.notice_label.setStyleSheet("padding: 4px;")
+        self.toolbar.addWidget(self.notice_label)
+    
+    def _update_notice(self):
+        """Update the notice label based on calibration state."""
+        if self.active_preset is None:
+            # Check if any presets exist
+            has_presets = app_settings.CAL_PRESETS_DIR.exists() and \
+                         any(app_settings.CAL_PRESETS_DIR.glob('*.yaml'))
+            if has_presets:
+                self.notice_label.setText("No Default Preset")
+                self.notice_label.setStyleSheet("padding: 4px; color: #003050; font-weight: bold;")
+            else:
+                self.notice_label.setText("Calibration Needed")
+                self.notice_label.setStyleSheet("padding: 4px; color: #003050; font-weight: bold;")
+        else:
+            self.notice_label.setText("")
+            self.notice_label.setStyleSheet("padding: 4px;")
 
     def _setup_shortcuts(self):
         """Setup global keyboard shortcuts that work regardless of focus."""
@@ -1626,7 +1626,6 @@ class MainWindow(QtWidgets.QMainWindow):
         dock.setAllowedAreas(
             QtCore.Qt.LeftDockWidgetArea | QtCore.Qt.RightDockWidgetArea
         )
-
         widget = QtWidgets.QWidget(dock)
         layout = QtWidgets.QVBoxLayout(widget)
         
@@ -1646,11 +1645,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.brightness_slider.setRange(-100, 100)
         self.brightness_spin = QtWidgets.QSpinBox()
         self.brightness_spin.setRange(-100, 100)
-
         # Keep slider and spinbox in sync
         self.brightness_slider.valueChanged.connect(self.brightness_spin.setValue)
         self.brightness_spin.valueChanged.connect(self.brightness_slider.setValue)
-
         # Send updates to worker (DirectConnection since worker loop is blocking)
         self.brightness_slider.valueChanged.connect(
             self.worker.set_brightness, QtCore.Qt.DirectConnection)
@@ -1661,22 +1658,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.contrast_spin = QtWidgets.QDoubleSpinBox()
         self.contrast_spin.setRange(0.5, 2.0)
         self.contrast_spin.setSingleStep(0.1)
-
         # Sync slider <-> spinbox
         def on_contrast_slider(val: int):
             self.contrast_spin.blockSignals(True)
             self.contrast_spin.setValue(val / 100.0)
             self.contrast_spin.blockSignals(False)
-
         def on_contrast_spin(val: float):
             slider_val = int(val * 100)
             self.contrast_slider.blockSignals(True)
             self.contrast_slider.setValue(slider_val)
             self.contrast_slider.blockSignals(False)
-
         self.contrast_slider.valueChanged.connect(on_contrast_slider)
         self.contrast_spin.valueChanged.connect(on_contrast_spin)
-
         # Send to worker (DirectConnection since worker loop is blocking)
         self.contrast_slider.valueChanged.connect(
             self.worker.set_contrast_slider, QtCore.Qt.DirectConnection)
@@ -1701,7 +1694,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_all_lm_cb.setChecked(True)  # Default ON
         self.show_used_lm_cb = QtWidgets.QCheckBox("Highlight gaze landmarks")
         self.show_used_lm_cb.setChecked(True)
-
         self.show_all_lm_cb.toggled.connect(
             self.worker.set_show_landmarks_all, QtCore.Qt.DirectConnection)
         self.show_used_lm_cb.toggled.connect(
@@ -1853,6 +1845,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'contrast': self.contrast_slider.value() / 100.0,
             'left_eye_enabled': self.left_eye_cb.isChecked(),
             'right_eye_enabled': self.right_eye_cb.isChecked(),
+            'presets_order': self.presets_order,
+            'presets_rank': self.presets_rank,
         }
         
         # Add filter settings if dialog exists
@@ -1877,6 +1871,7 @@ class MainWindow(QtWidgets.QMainWindow):
         config_dir = app_settings.CAL_PRESETS_DIR.parent
         settings_file = config_dir / 'settings.yaml'
         if not settings_file.exists():
+            self._update_notice()
             return
         
         try:
@@ -1884,6 +1879,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 config = yaml.safe_load(f)
             
             if not config:
+                self._update_notice()
                 return
             
             # Apply loaded settings
@@ -1895,6 +1891,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.left_eye_cb.setChecked(config['left_eye_enabled'])
             if 'right_eye_enabled' in config:
                 self.right_eye_cb.setChecked(config['right_eye_enabled'])
+            
+            # Load preset management lists
+            if 'presets_order' in config:
+                self.presets_order = config['presets_order']
+            if 'presets_rank' in config:
+                self.presets_rank = config['presets_rank']
+            
+            # Clean lists of missing files
+            if app_settings.CAL_PRESETS_DIR.exists():
+                existing = {f.name for f in app_settings.CAL_PRESETS_DIR.glob('*.yaml')}
+                self.presets_order = [f for f in self.presets_order if f in existing]
+                self.presets_rank = [f for f in self.presets_rank if f in existing]
+            
+            # Load default preset if available
+            if self.presets_rank:
+                default_file = app_settings.CAL_PRESETS_DIR / self.presets_rank[0]
+                if default_file.exists():
+                    try:
+                        preset = calibration.CalibrationData.load(default_file)
+                        self.select_preset(preset)
+                        print(f"[UI] Loaded default preset: {preset.name}")
+                    except Exception as e:
+                        print(f"[UI] Error loading default preset: {e}")
             
             # Apply filter settings to worker immediately
             if 'filters' in config:
@@ -1913,8 +1932,13 @@ class MainWindow(QtWidgets.QMainWindow):
             
             print(f"[UI] Loaded settings from {settings_file}")
             self.status.showMessage("Settings loaded", 2000)
+            
+            # Update notice
+            self._update_notice()
+            
         except Exception as e:
             print(f"[UI] Error loading settings: {e}")
+            self._update_notice()
 
     def start_calibration(self):
         """Start calibration process."""
@@ -1965,14 +1989,25 @@ class MainWindow(QtWidgets.QMainWindow):
         
         # Auto-select the new preset
         self.active_preset = cal_data
-        self.status.showMessage(f"Active preset: {cal_data.name}", 3000)
         
         # Send corner data to worker for plotting
         corners = cal_data.get_corners()
         self.worker.set_calibration_corners(corners)
         
+        # Check if this was set as default (stored during save dialog)
+        if hasattr(cal_data, '_set_as_default') and cal_data._set_as_default:
+            filename = getattr(cal_data, '_filename', None)
+            if filename:
+                if filename in self.presets_rank:
+                    self.presets_rank.remove(filename)
+                self.presets_rank.insert(0, filename)
+                self.save_settings()
+        
         # Refresh favorite buttons
         self._refresh_preset_buttons()
+        self._update_notice()
+        
+        self.status.showMessage(f"Active preset: {cal_data.name}", 3000)
 
     def on_calibration_cancelled(self):
         """Handle calibration cancellation."""
@@ -1981,12 +2016,41 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def open_presets_manager(self):
         """Open the presets manager dialog."""
-        dialog = calibration.PresetsManagerDialog(self)
+        dialog = calibration.PresetsManagerDialog(
+            presets_order=self.presets_order,
+            presets_rank=self.presets_rank,
+            active_preset=self.active_preset,
+            parent=self
+        )
         dialog.presetSelected.connect(self.select_preset)
+        dialog.presetsOrderChanged.connect(self._on_presets_order_changed)
+        dialog.presetsRankChanged.connect(self._on_presets_rank_changed)
         dialog.exec()
         
         # Refresh favorite buttons after manager closes
         self._refresh_preset_buttons()
+        self._update_notice()
+    
+    def _on_presets_order_changed(self, new_order: list):
+        """Handle presets order change from manager."""
+        self.presets_order = new_order
+        self.save_settings()
+    
+    def _on_presets_rank_changed(self, new_rank: list):
+        """Handle presets rank change from manager."""
+        self.presets_rank = new_rank
+        self.save_settings()
+        # If rank changed and we have a new default, load it
+        if new_rank and (self.active_preset is None or 
+                        getattr(self.active_preset, '_filename', None) != new_rank[0]):
+            default_file = app_settings.CAL_PRESETS_DIR / new_rank[0]
+            if default_file.exists():
+                try:
+                    preset = calibration.CalibrationData.load(default_file)
+                    self.select_preset(preset)
+                except Exception as e:
+                    print(f"[UI] Error loading new default: {e}")
+        self._update_notice()
     
     def select_preset(self, preset: calibration.CalibrationData):
         """Select and activate a preset."""
@@ -1999,6 +2063,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.worker.set_calibration_corners(corners)
         else:
             self.worker.set_calibration_corners(None)
+        
+        self._update_notice()
 
     def _refresh_preset_buttons(self):
         """Refresh favorite preset buttons in toolbar."""
