@@ -14,6 +14,8 @@ warnings.filterwarnings('ignore', category=UserWarning)
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 import sys
+sys.stdout.reconfigure(line_buffering=True)
+
 import time
 import math
 import argparse
@@ -131,7 +133,7 @@ def termplot(level: int, line: str):
     """Print plot data if verbosity level is high enough.
     
     Usage:
-        termplot(1, "PLOT:EYE_L.x:{:.4f} PLOT:EYE_L.y:{:.4f}".format(x, y))
+        termplot(1, "PLOT:EYE_L.x:{:.4f} EYE_L.y:{:.4f}".format(x, y))
     
     Output can be filtered with:
         ./gaze.py -P 1 | grep ^PLOT: | sed 's/^PLOT://' | splotty -
@@ -189,6 +191,7 @@ class VideoWorker(QtCore.QObject):
             'eye_corners': filters.LandmarkFilterSet(DEF_MEDIAN_WINDOW, DEF_EMA_ALPHA, DEF_FILTER_ENABLED),
             'eye_lids': filters.LandmarkFilterSet(DEF_MEDIAN_WINDOW, DEF_EMA_ALPHA, DEF_FILTER_ENABLED),
             'face_orientation': filters.LandmarkFilterSet(DEF_MEDIAN_WINDOW, DEF_EMA_ALPHA, DEF_FILTER_ENABLED),
+            'single_eye': filters.LandmarkFilterSet(DEF_MEDIAN_WINDOW, DEF_EMA_ALPHA * 0.5, DEF_FILTER_ENABLED),
         }
         
         # Map landmark indices to filter groups
@@ -207,6 +210,17 @@ class VideoWorker(QtCore.QObject):
         # Eye open ratio threshold (height / width) for blink / eye-closed detection
         self._eye_open_thresh = 0.20
 
+        # Per-eye bias tracking (deviation from binocular average)
+        # Updated every frame when both eyes visible
+        self._left_bias = np.array([0.0, 0.0], dtype=np.float32)
+        self._right_bias = np.array([0.0, 0.0], dtype=np.float32)
+        self._bias_alpha = 0.1  # EMA alpha for bias updates
+        self._bias_lock = QtCore.QMutex()
+        
+        # Calibration corner data for plotting (set from MainWindow when preset selected)
+        self._cal_corners = None  # {'tl': {'gaze': [x,y]}, 'tr': ..., 'bl': ..., 'br': ..., 'center': ...}
+        self._cal_corners_lock = QtCore.QMutex()
+        
         # Landmark visualization toggles
         self._show_landmarks_raw = False  # Raw unfiltered landmarks
         self._show_landmarks_all = True  # Filtered landmarks (all)
@@ -312,6 +326,17 @@ class VideoWorker(QtCore.QObject):
                 self._filter_groups[group].enabled = enabled
                 print(f"[Worker] {group} filtering {'enabled' if enabled else 'disabled'}")
 
+    @QtCore.Slot(object)
+    def set_calibration_corners(self, corners: dict):
+        """Set calibration corner data for plotting."""
+        print(f"[Worker] set_calibration_corners called with: {corners}")
+        with QtCore.QMutexLocker(self._cal_corners_lock):
+            self._cal_corners = corners
+            if corners:
+                print(f"[Worker] Calibration corners set: {list(corners.keys())}")
+            else:
+                print("[Worker] Calibration corners cleared")
+    
     # ---- Slots for landmark filter parameters ----
 
     @QtCore.Slot(bool)
@@ -833,32 +858,8 @@ class VideoWorker(QtCore.QObject):
         final_face_vector = final_face_vector / (np.linalg.norm(final_face_vector) + 1e-6)
         face_dir_prelim = np.array([final_face_vector[0], final_face_vector[1]], dtype=np.float32)
         
-        # Store raw eye gaze before transformation (for debug output)
-        left_raw = left["dir_norm"].copy()
-        right_raw = right["dir_norm"].copy()
-        
-        # Transform each eye's gaze: rotate to head space, then ADD face-aim
-        # Rationale: If eyes look at world angle +20, head turns +5 toward target,
-        # eye-relative gaze shifts to +15. World gaze = eye-relative + head = 15 + 5 = 20
-        def transform_gaze(gaze_2d):
-            """Transform gaze into world coordinates by adding face-aim."""
-            # Rotate to head-aligned coordinates
-            rotated = rotation_matrix @ gaze_2d
-            # ADD face-aim to get world-space gaze direction
-            corrected = rotated + face_dir_prelim
-            return corrected
-        
-        # Apply transformation to eye gaze vectors (modifies in place)
-        left["dir_norm"] = transform_gaze(left["dir_norm"])
-        right["dir_norm"] = transform_gaze(right["dir_norm"])
-        
-        # Output plot data at level 1
-        if _print_data_level >= 1:
-            termplot(1, f"PLOT:EYE_L_RAW.x:{left_raw[0]:.4f} PLOT:EYE_L_RAW.y:{left_raw[1]:.4f} "
-                       f"PLOT:EYE_R_RAW.x:{right_raw[0]:.4f} PLOT:EYE_R_RAW.y:{right_raw[1]:.4f} "
-                       f"PLOT:FACE.x:{face_dir_prelim[0]:.4f} PLOT:FACE.y:{face_dir_prelim[1]:.4f} "
-                       f"PLOT:EYE_L.x:{left['dir_norm'][0]:.4f} PLOT:EYE_L.y:{left['dir_norm'][1]:.4f} "
-                       f"PLOT:EYE_R.x:{right['dir_norm'][0]:.4f} PLOT:EYE_R.y:{right['dir_norm'][1]:.4f}")
+        # Note: Individual eye vectors (left["dir_norm"], right["dir_norm"]) stay raw/unmodified
+        # Face aim is added only to the final averaged gaze vector below
         
         # Check which eyes are enabled
         with QtCore.QMutexLocker(self._eye_enable_lock):
@@ -963,16 +964,51 @@ class VideoWorker(QtCore.QObject):
 
         # Combined gaze (average of open AND enabled eyes)
         open_dirs = []
+        open_labels = []  # Track which eyes: 'left', 'right'
         centers_px = []
-        for info, is_open, is_enabled in ((left, left_open, left_eye_enabled), (right, right_open, right_eye_enabled)):
+        for info, is_open, is_enabled, label in (
+            (left, left_open, left_eye_enabled, 'left'),
+            (right, right_open, right_eye_enabled, 'right')
+        ):
             if is_open and is_enabled:
                 open_dirs.append(info["dir_norm"])
+                open_labels.append(label)
                 # Use iris center for combined gaze origin
                 iris_px = (int(info["iris_center"][0] * w), int(info["iris_center"][1] * h))
                 centers_px.append(iris_px)
 
-        if open_dirs:
+        avg_dir = None
+        if len(open_dirs) == 2:
+            # Both eyes - compute average and update bias estimates
             avg_dir = np.mean(open_dirs, axis=0)
+            with QtCore.QMutexLocker(self._bias_lock):
+                self._left_bias = (1 - self._bias_alpha) * self._left_bias + \
+                                  self._bias_alpha * (left["dir_norm"] - avg_dir)
+                self._right_bias = (1 - self._bias_alpha) * self._right_bias + \
+                                   self._bias_alpha * (right["dir_norm"] - avg_dir)
+        elif len(open_dirs) == 1:
+            # Single eye - apply bias correction to match what binocular average would be
+            raw_gaze = open_dirs[0]
+            with QtCore.QMutexLocker(self._bias_lock):
+                if open_labels[0] == 'left':
+                    avg_dir = raw_gaze - self._left_bias
+                else:
+                    avg_dir = raw_gaze - self._right_bias
+            
+            # Apply single_eye filter for extra smoothing
+            with QtCore.QMutexLocker(self._filter_lock):
+                # Use index 0 for x, 1 for y in the single_eye filter
+                avg_dir_3d = np.array([avg_dir[0], avg_dir[1], 0.0], dtype=np.float32)
+                filtered = self._filter_groups['single_eye'].update(0, avg_dir_3d)
+                avg_dir = np.array([filtered[0], filtered[1]], dtype=np.float32)
+        # else: no eyes open - avg_dir stays None, no update
+        
+        if avg_dir is not None:
+            # Add face aim to averaged gaze to get world-space direction
+            # Rationale: If eyes look at world angle +20, head turns +5 toward target,
+            # eye-relative gaze shifts to +15. World gaze = eye-relative + head = 15 + 5 = 20
+            avg_dir = avg_dir + face_dir_prelim
+            
             avg_center = np.mean(np.array(centers_px, dtype=np.float32), axis=0)
             acx, acy = int(avg_center[0]), int(avg_center[1])
             end_pt = (
@@ -992,9 +1028,26 @@ class VideoWorker(QtCore.QObject):
                 cv2.LINE_AA,
             )
             
-            # Output combined/avg gaze at level 1
+            # Output plot data at level 1
+            print(f"_print_data_level: {_print_data_level}")
             if _print_data_level >= 1:
-                termplot(1, f"PLOT:EYES.x:{avg_dir[0]:.4f} PLOT:EYES.y:{avg_dir[1]:.4f}")
+                parts = [f"PLOT:EYES.x:{avg_dir[0]:.4f} EYES.y:{avg_dir[1]:.4f}",
+                        f"FACE.x:{face_dir_prelim[0]:.4f} FACE.y:{face_dir_prelim[1]:.4f}",
+                        f"N_EYES:{len(open_dirs)}"]
+                
+                # Add corner calibration values as constant reference lines
+                print("GET mutex?")
+                with QtCore.QMutexLocker(self._cal_corners_lock):
+                    print(f"_cal_corners:{self._cal_corners}")
+                    if self._cal_corners:
+                        for name in ('tl', 'tr', 'bl', 'br'):
+                            corner = self._cal_corners.get(name)
+                            if corner and corner.get('gaze'):
+                                print(f"  corner:{corner}")
+                                gx, gy = corner['gaze']
+                                parts.append(f"C_{name}.x:{gx:.4f} C_{name}.y:{gy:.4f}")
+                
+                termplot(1, ' '.join(parts))
             
             # Track persistent max gaze bounds
             with QtCore.QMutexLocker(self._gaze_bounds_lock):
@@ -1246,12 +1299,13 @@ class FiltersDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         
         # Create filter controls for each group
-        self.filter_groups = ['iris_pupil', 'eye_corners', 'eye_lids', 'face_orientation']
+        self.filter_groups = ['iris_pupil', 'eye_corners', 'eye_lids', 'face_orientation', 'single_eye']
         self.group_labels = {
             'iris_pupil': 'Iris/Pupil',
             'eye_corners': 'Eye Corners',
             'eye_lids': 'Eye Lids',
-            'face_orientation': 'Face Orientation'
+            'face_orientation': 'Face Orientation',
+            'single_eye': 'Single Eye Mode'
         }
         
         # Store widget references for each group
@@ -1913,9 +1967,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.active_preset = cal_data
         self.status.showMessage(f"Active preset: {cal_data.name}", 3000)
         
+        # Send corner data to worker for plotting
+        corners = cal_data.get_corners()
+        self.worker.set_calibration_corners(corners)
+        
         # Refresh favorite buttons
         self._refresh_preset_buttons()
-    
+
     def on_calibration_cancelled(self):
         """Handle calibration cancellation."""
         self.status.showMessage("Calibration cancelled", 2000)
@@ -1934,7 +1992,14 @@ class MainWindow(QtWidgets.QMainWindow):
         """Select and activate a preset."""
         self.active_preset = preset
         self.status.showMessage(f"Active preset: {preset.name}", 3000)
-    
+        
+        # Send corner data to worker for plotting
+        if preset:
+            corners = preset.get_corners()
+            self.worker.set_calibration_corners(corners)
+        else:
+            self.worker.set_calibration_corners(None)
+
     def _refresh_preset_buttons(self):
         """Refresh favorite preset buttons in toolbar."""
         print("[UI] Refreshing preset buttons...")

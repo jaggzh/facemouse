@@ -215,6 +215,67 @@ class CalibrationData:
         
         return averaged
     
+    def get_corners(self) -> Dict[str, Optional[Dict]]:
+        """Get corner calibration points (tl, tr, bl, br) and center if available.
+        
+        Returns dict with keys: 'tl', 'tr', 'bl', 'br', 'center'
+        Each value is {'screen': (x, y), 'gaze': [gx, gy]} or None if not found.
+        
+        Works with any grid size by finding actual min/max screen positions.
+        """
+        averaged = self.get_averaged_data()
+        if not averaged:
+            return {'tl': None, 'tr': None, 'bl': None, 'br': None, 'center': None}
+        
+        # Find screen coordinate bounds
+        screen_positions = list(averaged.keys())
+        xs = [p[0] for p in screen_positions]
+        ys = [p[1] for p in screen_positions]
+        
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        
+        # Define corner screen positions
+        corner_screens = {
+            'tl': (min_x, min_y),
+            'tr': (max_x, min_y),
+            'bl': (min_x, max_y),
+            'br': (max_x, max_y),
+        }
+        
+        corners = {}
+        for name, screen_pos in corner_screens.items():
+            if screen_pos in averaged:
+                data = averaged[screen_pos]
+                gaze = data.get('avg_gaze')
+                corners[name] = {'screen': screen_pos, 'gaze': gaze} if gaze else None
+            else:
+                corners[name] = None
+        
+        # Center: find point closest to geometric center (works for any grid)
+        center_x = (min_x + max_x) / 2
+        center_y = (min_y + max_y) / 2
+        
+        closest_center = None
+        closest_dist = float('inf')
+        for screen_pos, data in averaged.items():
+            dist = abs(screen_pos[0] - center_x) + abs(screen_pos[1] - center_y)
+            if dist < closest_dist:
+                closest_dist = dist
+                closest_center = (screen_pos, data)
+        
+        # Only use center if it's reasonably close to geometric center
+        # (threshold: within 10% of screen diagonal)
+        diag = ((max_x - min_x)**2 + (max_y - min_y)**2)**0.5
+        if closest_center and closest_dist < diag * 0.1:
+            screen_pos, data = closest_center
+            gaze = data.get('avg_gaze')
+            corners['center'] = {'screen': screen_pos, 'gaze': gaze} if gaze else None
+        else:
+            corners['center'] = None
+        
+        return corners
+    
     @staticmethod
     def _convert_to_python_types(obj):
         """Recursively convert numpy types to Python native types for YAML serialization."""

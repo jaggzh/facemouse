@@ -1,0 +1,41 @@
+We should keep the old default, if any. The presets manager will definitely need a new option, like our favorites, but one where we only allow ONE to be checked off. If the user picks one, any active one must be cleared.  If we really want to be user-friendly (I love resolving problems that are typically inconvenient UX issues), we can keep a numbering as an integer in a "default", on each preset ever set as default. It will be internal and not visible. When a user removes the current active one, the prior one ends up being automatically selected. We have a choice to go with the highest number being the default, or the lowest (eg. 1).
+
+Let's just do the highest number has the highest precedence.
+
+So, the algorithm will be:
+# Upon user saving a new preset:
+  1. if [x] Set as default is selected (the default), we take:
+   max_preset_rank = max( [p for p in presets if p.default_rank is not none]);  # Not sure if max() will crash on an empty list?
+   new_preset_rank = 1 if max_preset_rank is None else max_preset_rank + 1 # Assign a new highest number
+
+
+# We need to move our sort_order into our app settings, not stored in preset files.
+Our default_rank also will be in our app settings.
+We can just keep them as lists, or we can keep a number with them.
+I think lists suffice; for instance, instead of a sort_order number, we get the index of the existing, remove it, and re-insert at index-1 if shifted higher ("move up") (and it's not the first already, of course), and index+1 if moved lower, right?
+
+Ex: settings.presets_order = [ "some preset.yaml", "other preset.yaml" ]
+Ex: settings.presets_rank = [ "best preset.yaml", "some preset.yaml" ]
+
+We might as well scan the presets upon loading, filtering out missing files from the order and rank lists.
+Then we go through the rank list, if anything is there, and use the first, which is the highest rank priority (ie. when a user says "this is my default", it's added to the start of the list. This way, if a preset is removed from disk, the prior one will be active automatically.
+
+Upon saving a preset:
+If "Set as default" is *unchecked*, the rank list is not modified. If it's checked, we insert that preset at [0].
+
+In presets view:
+There is only an indicator of the current default (ie. [0] is checked off) (a column). It's too much clutter to show numbers of their default priorities or other indicator. A radio-style selection column for them is simple and sufficient functionality.
+
+If we can't do radio items in a "Default" column, prior to the favorites column, that's preferable. If not, then we have to do checkmarks right? But we have to prevent multi-select. Whichever item is checked off is placed/moved to the front of the rank list upon closing of the presets window. Thus, the user does not directly manage the rank list -- they can only say "this is my default", and we move it to the front of the rank list. (Without this, we would end up sorting the default (rank) list each time they click; we do not want to do that.)
+
+Without a default during app load, perhaps we should have an indicator in the UI.
+Let's add a short text area to the right of our top buttons. Perhaps 24em.
+if calib_data is None:
+	if len(calibs): notice_add("No Default Preset", fg="#003050")
+	else: notice_add("Calibration Needed, fg="#003050")
+
+In preset manager, let's add a button to the right of Move Down, "Save Current Calib."
+That will pop up the Save Preset dialog? Is that too much trouble to refactor?
+
+Did I handle all the cases/edge cases?
+
