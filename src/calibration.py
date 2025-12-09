@@ -135,7 +135,6 @@ class CalibrationData:
         self.camera_description = ""  # e.g., "Webcam medium high"
         self.display_description = ""  # e.g., "3-foot"
         self.is_favorite = False
-        self.sort_order = 0
         self.grid_size = grid_size
         self.timestamp = datetime.now()
         self.points = {}  # (screen_x, screen_y) -> list of samples
@@ -324,7 +323,6 @@ class CalibrationData:
             'camera_description': self.camera_description,
             'display_description': self.display_description,
             'is_favorite': self.is_favorite,
-            'sort_order': self.sort_order,
             'grid_size': self.grid_size,
             'timestamp': self.timestamp.isoformat(),
             'points': averaged_points
@@ -340,7 +338,6 @@ class CalibrationData:
         cal.camera_description = data.get('camera_description', '')
         cal.display_description = data.get('display_description', '')
         cal.is_favorite = data.get('is_favorite', False)
-        cal.sort_order = data.get('sort_order', 0)
         cal.timestamp = datetime.fromisoformat(data['timestamp'])
         
         for pt_data in data.get('points', []):
@@ -395,9 +392,15 @@ class CalibrationData:
         return cls.from_dict(data)
     
     @classmethod
-    def list_presets(cls) -> List['CalibrationData']:
-        """List all saved presets."""
+    def list_presets(cls, presets_order: List[str] = None) -> List['CalibrationData']:
+        """List all saved presets.
+        
+        Args:
+            presets_order: Optional list of filenames for display order.
+                          Presets not in list appear at end alphabetically.
+        """
         presets = []
+        preset_by_filename = {}
         print(f"[Calibration] Looking for presets in {settings.CAL_PRESETS_DIR}")
         if settings.CAL_PRESETS_DIR.exists():
             yaml_files = list(settings.CAL_PRESETS_DIR.glob('*.yaml'))
@@ -405,312 +408,31 @@ class CalibrationData:
             for f in yaml_files:
                 try:
                     preset = cls.load(f)
+                    preset._filename = f.name  # Store for ordering
                     print(f"[Calibration] Loaded preset: {preset.name}")
                     presets.append(preset)
+                    preset_by_filename[f.name] = preset
                 except Exception as e:
                     print(f"[Calibration] Error loading {f}: {e}")
         else:
             print(f"[Calibration] Presets directory does not exist")
         
-        # Sort by sort_order, then by name
-        presets.sort(key=lambda p: (p.sort_order, p.name))
+        # Sort by presets_order, then alphabetically for unlisted
+        if presets_order:
+            ordered = []
+            seen = set()
+            for filename in presets_order:
+                if filename in preset_by_filename:
+                    ordered.append(preset_by_filename[filename])
+                    seen.add(filename)
+            # Add remaining presets alphabetically
+            remaining = [p for p in presets if p._filename not in seen]
+            remaining.sort(key=lambda p: p.name)
+            presets = ordered + remaining
+        else:
+            presets.sort(key=lambda p: p.name)
+        
         return presets
-    
-    @classmethod
-    def get_favorites(cls) -> List['CalibrationData']:
-        """Get favorited presets in sort order (fast - only loads favorites)."""
-        favorites = []
-        print(f"[Calibration] Loading favorites from {settings.CAL_PRESETS_DIR}")
-        
-        if not settings.CAL_PRESETS_DIR.exists():
-            return favorites
-        
-        # Quick scan: just load minimal data to check is_favorite flag
-        for f in settings.CAL_PRESETS_DIR.glob('*.yaml'):
-            try:
-                # Quick check if this is a favorite by reading just the header
-                with open(f, 'r') as file:
-                    # Read first 500 bytes to get the basic fields
-                    header = file.read(500)
-                    if 'is_favorite: true' in header or 'is_favorite:true' in header:
-                        # This is a favorite, load it fully
-                        preset = cls.load(f)
-                        favorites.append(preset)
-                        print(f"[Calibration] Loaded favorite: {preset.name}")
-            except Exception as e:
-                print(f"[Calibration] Error checking {f}: {e}")
-        
-        # Sort by sort_order, then by name
-        favorites.sort(key=lambda p: (p.sort_order, p.name))
-        print(f"[Calibration] Found {len(favorites)} favorites")
-        return favorites
-
-
-class CalibrationWindow(QtWidgets.QWidget):
-    """Fullscreen calibration window with video underlay."""
-    
-    # Signals
-    calibrationComplete = QtCore.Signal(CalibrationData)
-    calibrationCancelled = QtCore.Signal()
-    progressToNext = QtCore.Signal()  # Signal to move to next point (from worker thread)
-    
-    def __init__(self, screen_size: QtCore.QSize, grid_size: int = settings.DEF_CAL_GRID_SIZE, 
-                 active_preset: CalibrationData = None, cal_auto_collect_s: float = 3.0, 
-                 device_pixel_ratio: float = 1.0, parent=None):
-        super().__init__(parent)
-        self.screen_size = screen_size  # Logical size for Qt drawing
-        self.device_pixel_ratio = device_pixel_ratio  # For converting to physical coordinates
-        self.grid_size = grid_size
-        self.active_preset = active_preset  # For cursor visualization
-        self.cal_auto_collect_s = cal_auto_collect_s
-        
-        # Calibration state
-        self.cal_data = CalibrationData(grid_size=grid_size)
-        self.grid_points = self._generate_grid_points()
-        self.remaining_points = list(self.grid_points)
-        self.current_point = None
-        self.current_frame = None
-        self.current_gaze_data = None
-        
-        # Auto-collection state
-        self.auto_collecting = False
-        self.auto_collect_start = None
-        self.auto_collect_samples = []
-        
-        # Opacity/darkening toggle
-        self.darkening_enabled = True
-        
-        # Computed cursor position (screen coordinates)
-        self.cursor_screen_pos = None
-        
-        # UI setup
-        self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.FramelessWindowHint)
-        self.setGeometry(0, 0, screen_size.width(), screen_size.height())
-        # Keep cursor visible for assistant to click buttons
-        self.setCursor(QtCore.Qt.ArrowCursor)
-        
-        print(f"[Calibration] Requested geometry: {screen_size.width()}x{screen_size.height()}")
-        print(f"[Calibration] Actual geometry after setGeometry: {self.width()}x{self.height()}")
-        
-        # Create controls
-        self._create_controls()
-        
-        # Connect internal signals (must be in main thread)
-        self.progressToNext.connect(self._next_point, QtCore.Qt.QueuedConnection)
-        
-        # DON'T start calibration here - wait for finalize_after_show()
-    
-    def finalize_after_show(self):
-        """Finalize calibration setup after window is shown (regenerate grid if needed)."""
-        # Check if actual window size matches expected
-        actual_w, actual_h = self.width(), self.height()
-        expected_w, expected_h = self.screen_size.width(), self.screen_size.height()
-        
-        print(f"[Calibration] After show - Expected: {expected_w}x{expected_h}, Actual: {actual_w}x{actual_h}")
-        
-        if actual_w != expected_w or actual_h != expected_h:
-            print(f"[Calibration] Size mismatch! Regenerating grid with actual window size")
-            self.screen_size = QtCore.QSize(actual_w, actual_h)
-            self.grid_points = self._generate_grid_points()
-            self.remaining_points = list(self.grid_points)
-        
-        # Now start calibration with correct coordinates
-        self._next_point()
-        tts("Calibrating")
-    
-    def _generate_grid_points(self) -> List[Tuple[int, int]]:
-        """Generate grid of calibration points in LOGICAL coordinates (for Qt drawing)."""
-        rows, cols = settings.CAL_GRID_CONFIGS[self.grid_size]
-        w, h = self.screen_size.width(), self.screen_size.height()
-        
-        points = []
-        for row in range(rows):
-            for col in range(cols):
-                # Place points at edges and evenly spaced
-                # Use width-1 and height-1 since screen coordinates are 0-indexed
-                x = int((col / (cols - 1)) * (w - 1)) if cols > 1 else w // 2
-                y = int((row / (rows - 1)) * (h - 1)) if rows > 1 else h // 2
-                points.append((x, y))
-        
-        print(f"[Calibration] Generated {len(points)} grid points (logical): {points[:3]}...")
-        return points
-    
-    def _logical_to_physical(self, logical_point: Tuple[int, int]) -> Tuple[int, int]:
-        """Convert logical Qt coordinates to physical screen/mouse coordinates."""
-        x, y = logical_point
-        physical_x = int(x * self.device_pixel_ratio)
-        physical_y = int(y * self.device_pixel_ratio)
-        return (physical_x, physical_y)
-    
-    def _create_controls(self):
-        """Create control buttons."""
-        # Button panel at bottom center
-        self.button_widget = QtWidgets.QWidget(self)
-        button_layout = QtWidgets.QHBoxLayout(self.button_widget)
-        
-        # Apply calibration button scaling
-        btn_font_size = settings.scaled_font_size(12, settings.DEF_UI_SCALE_CAL_BUTTONS)
-        btn_font = QtGui.QFont()
-        btn_font.setPointSize(btn_font_size)
-        btn_font.setBold(True)
-        
-        btn_min_w = settings.scaled_size(150, settings.DEF_UI_SCALE_CAL_BUTTONS)
-        btn_min_h = settings.scaled_size(50, settings.DEF_UI_SCALE_CAL_BUTTONS)
-        
-        self.collect_btn = QtWidgets.QPushButton(f"(C)ollect {self.cal_auto_collect_s:.0f}s")
-        self.collect_btn.setFont(btn_font)
-        self.collect_btn.setMinimumSize(btn_min_w, btn_min_h)
-        self.collect_btn.clicked.connect(self._start_auto_collect)
-        
-        self.opacity_btn = QtWidgets.QPushButton("(O)pacity")
-        self.opacity_btn.setFont(btn_font)
-        self.opacity_btn.setMinimumSize(btn_min_w, btn_min_h)
-        self.opacity_btn.setCheckable(True)
-        self.opacity_btn.setChecked(True)  # Darkening on by default
-        self.opacity_btn.clicked.connect(self.toggle_opacity)
-        
-        self.accept_btn = QtWidgets.QPushButton("Accept Point (A)")
-        self.accept_btn.setFont(btn_font)
-        self.accept_btn.setMinimumSize(btn_min_w, btn_min_h)
-        self.accept_btn.clicked.connect(self.accept_point)
-        
-        self.undo_btn = QtWidgets.QPushButton("Undo Last (U)")
-        self.undo_btn.setFont(btn_font)
-        self.undo_btn.setMinimumSize(btn_min_w, btn_min_h)
-        self.undo_btn.clicked.connect(self.undo_point)
-        
-        self.cancel_btn = QtWidgets.QPushButton("Cancel (Esc)")
-        self.cancel_btn.setFont(btn_font)
-        self.cancel_btn.setMinimumSize(btn_min_w, btn_min_h)
-        self.cancel_btn.clicked.connect(self.cancel_calibration)
-        
-        button_layout.addWidget(self.collect_btn)
-        button_layout.addWidget(self.opacity_btn)
-        button_layout.addWidget(self.accept_btn)
-        button_layout.addWidget(self.undo_btn)
-        button_layout.addWidget(self.cancel_btn)
-        
-        # Position at bottom center
-        self.button_widget.adjustSize()
-        self.button_widget.move(
-            (self.screen_size.width() - self.button_widget.width()) // 2,
-            self.screen_size.height() - self.button_widget.height() - 20
-        )
-    
-    def _next_point(self):
-        """Select and display next calibration point (sequential for MVP)."""
-        # Announce previous point's sample count if any
-        if self.current_point is not None:
-            physical_point = self._logical_to_physical(self.current_point)
-            count = self.cal_data.get_sample_count(physical_point)
-            if count > 0:
-                tts(f"{count}")  # Just say the number
-        
-        if not self.remaining_points:
-            # Calibration complete
-            self._complete_calibration()
-            return
-        
-        # Sequential order for simplicity (start corner, work through grid)
-        self.current_point = self.remaining_points.pop(0)
-        
-        self.update()
-        
-        # TTS direction hint - just say the direction
-        direction = self._get_direction_text(self.current_point)
-        tts(direction)  # Just "top left", not "Look at the top left"
-        print(f"[Calibration] Next point: {self.current_point} ({direction})")
-    
-    def _get_direction_text(self, point: Tuple[int, int]) -> str:
-        """Get human-readable direction for a point."""
-        x, y = point
-        w, h = self.screen_size.width(), self.screen_size.height()
-        
-        vert = "top" if y < h / 3 else ("bottom" if y > 2 * h / 3 else "middle")
-        horiz = "left" if x < w / 3 else ("right" if x > 2 * w / 3 else "center")
-        
-        if vert == "middle" and horiz == "center":
-            return "center"
-        elif vert == "middle":
-            return horiz
-        elif horiz == "center":
-            return vert
-        else:
-            return f"{vert} {horiz}"
-    
-    @QtCore.Slot(np.ndarray, dict)
-    def update_frame_and_data(self, frame: np.ndarray, gaze_data: dict):
-        """Update video frame and current gaze data."""
-        self.current_frame = frame
-        self.current_gaze_data = gaze_data
-        
-        # Handle auto-collection
-        if self.auto_collecting and gaze_data:
-            elapsed = datetime.now().timestamp() - self.auto_collect_start
-            if elapsed < self.cal_auto_collect_s:
-                # Still collecting
-                self.auto_collect_samples.append(gaze_data)
-            else:
-                # Done collecting
-                self._finish_auto_collect()
-        
-        # Compute cursor screen position from gaze data
-        if gaze_data and gaze_data.get('avg_gaze') is not None:
-            avg_gaze = gaze_data['avg_gaze']
-            w, h = self.screen_size.width(), self.screen_size.height()
-            
-            if self.active_preset:
-                cx, cy = self._map_gaze_with_preset(gaze_data, w, h)
-            else:
-                cx = w // 2 - int(avg_gaze[0] * w * 0.5)
-                cy = h // 2 + int(avg_gaze[1] * h * 0.5)
-            
-            cx = max(0, min(w - 1, cx))
-            cy = max(0, min(h - 1, cy))
-            self.cursor_screen_pos = (cx, cy)
-        else:
-            self.cursor_screen_pos = None
-        
-        self.update()
-    
-    def _map_gaze_with_preset(self, gaze_data: dict, screen_w: int, screen_h: int) -> Tuple[int, int]:
-        """Map gaze data to screen coordinates using calibration preset."""
-        avg_gaze = gaze_data.get('avg_gaze')
-        if avg_gaze is None:
-            return screen_w // 2, screen_h // 2
-        
-        cal_points = self.active_preset.get_averaged_data()
-        
-        if not cal_points:
-            return screen_w // 2 - int(avg_gaze[0] * screen_w * 0.5), \
-                   screen_h // 2 + int(avg_gaze[1] * screen_h * 0.5)
-        
-        gaze_x, gaze_y = avg_gaze[0], avg_gaze[1]
-        
-        # Inverse distance weighting
-        total_weight = 0.0
-        weighted_x = 0.0
-        weighted_y = 0.0
-        
-        for (screen_x, screen_y), data in cal_points.items():
-            if data.get('avg_gaze') is None:
-                continue
-            
-            cal_gaze = data['avg_gaze']
-            dist = np.sqrt((gaze_x - cal_gaze[0])**2 + (gaze_y - cal_gaze[1])**2)
-            
-            if dist < 0.001:
-                return screen_x, screen_y
-            
-            weight = 1.0 / (dist ** 2)
-            total_weight += weight
-            weighted_x += screen_x * weight
-            weighted_y += screen_y * weight
-        
-        if total_weight > 0:
-            return int(weighted_x / total_weight), int(weighted_y / total_weight)
-        else:
-            return screen_w // 2, screen_h // 2
     
     def _start_auto_collect(self):
         """Start auto-collection mode."""

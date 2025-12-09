@@ -5,6 +5,12 @@ Global settings and defaults for the gaze tracker.
 
 from pathlib import Path
 
+DEF_CAL_GRID_SIZE = 9  # Number of calibration points
+
+# Preset management defaults
+DEF_PRESETS_ORDER = []  # Display order of preset filenames
+DEF_PRESETS_RANK = []   # Default priority (first = current default)
+
 # ============================================================================
 # UI Scaling
 # ============================================================================
