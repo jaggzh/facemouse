@@ -338,6 +338,7 @@ class CalibrationData:
         cal.camera_description = data.get('camera_description', '')
         cal.display_description = data.get('display_description', '')
         cal.is_favorite = data.get('is_favorite', False)
+        # sort_order ignored - now managed in app settings presets_order
         cal.timestamp = datetime.fromisoformat(data['timestamp'])
         
         for pt_data in data.get('points', []):
@@ -389,7 +390,9 @@ class CalibrationData:
                 except Exception as e:
                     raise ValueError(f"Could not parse YAML: {e}")
         
-        return cls.from_dict(data)
+        cal = cls.from_dict(data)
+        cal._filename = filename.name  # Store filename for reference
+        return cal
     
     @classmethod
     def list_presets(cls, presets_order: List[str] = None) -> List['CalibrationData']:
@@ -433,6 +436,302 @@ class CalibrationData:
             presets.sort(key=lambda p: p.name)
         
         return presets
+    
+    @classmethod
+    def get_favorites(cls) -> List['CalibrationData']:
+        """Get favorited presets in sort order (fast - only loads favorites)."""
+        favorites = []
+        print(f"[Calibration] Loading favorites from {settings.CAL_PRESETS_DIR}")
+        
+        if not settings.CAL_PRESETS_DIR.exists():
+            return favorites
+        
+        # Quick scan: just load minimal data to check is_favorite flag
+        for f in settings.CAL_PRESETS_DIR.glob('*.yaml'):
+            try:
+                # Quick check if this is a favorite by reading just the header
+                with open(f, 'r') as file:
+                    # Read first 500 bytes to get the basic fields
+                    header = file.read(500)
+                    if 'is_favorite: true' in header or 'is_favorite:true' in header:
+                        # This is a favorite, load it fully
+                        preset = cls.load(f)
+                        favorites.append(preset)
+                        print(f"[Calibration] Loaded favorite: {preset.name}")
+            except Exception as e:
+                print(f"[Calibration] Error checking {f}: {e}")
+        
+        # Sort alphabetically (order is managed separately)
+        favorites.sort(key=lambda p: p.name)
+        print(f"[Calibration] Found {len(favorites)} favorites")
+        return favorites
+
+
+class CalibrationWindow(QtWidgets.QWidget):
+    """Fullscreen calibration window with video underlay."""
+    
+    # Signals
+    calibrationComplete = QtCore.Signal(CalibrationData)
+    calibrationCancelled = QtCore.Signal()
+    progressToNext = QtCore.Signal()  # Signal to move to next point (from worker thread)
+    
+    def __init__(self, screen_size: QtCore.QSize, grid_size: int = settings.DEF_CAL_GRID_SIZE, 
+                 active_preset: CalibrationData = None, cal_auto_collect_s: float = 3.0, 
+                 device_pixel_ratio: float = 1.0, parent=None):
+        super().__init__(parent)
+        self.screen_size = screen_size  # Logical size for Qt drawing
+        self.device_pixel_ratio = device_pixel_ratio  # For converting to physical coordinates
+        self.grid_size = grid_size
+        self.active_preset = active_preset  # For cursor visualization
+        self.cal_auto_collect_s = cal_auto_collect_s
+        
+        # Calibration state
+        self.cal_data = CalibrationData(grid_size=grid_size)
+        self.grid_points = self._generate_grid_points()
+        self.remaining_points = list(self.grid_points)
+        self.current_point = None
+        self.current_frame = None
+        self.current_gaze_data = None
+        
+        # Auto-collection state
+        self.auto_collecting = False
+        self.auto_collect_start = None
+        self.auto_collect_samples = []
+        
+        # Opacity/darkening toggle
+        self.darkening_enabled = True
+        
+        # Computed cursor position (screen coordinates)
+        self.cursor_screen_pos = None
+        
+        # UI setup
+        self.setWindowFlags(QtCore.Qt.Window | QtCore.Qt.FramelessWindowHint)
+        self.setGeometry(0, 0, screen_size.width(), screen_size.height())
+        # Keep cursor visible for assistant to click buttons
+        self.setCursor(QtCore.Qt.ArrowCursor)
+        
+        print(f"[Calibration] Requested geometry: {screen_size.width()}x{screen_size.height()}")
+        print(f"[Calibration] Actual geometry after setGeometry: {self.width()}x{self.height()}")
+        
+        # Create controls
+        self._create_controls()
+        
+        # Connect internal signals (must be in main thread)
+        self.progressToNext.connect(self._next_point, QtCore.Qt.QueuedConnection)
+        
+        # DON'T start calibration here - wait for finalize_after_show()
+    
+    def finalize_after_show(self):
+        """Finalize calibration setup after window is shown (regenerate grid if needed)."""
+        # Check if actual window size matches expected
+        actual_w, actual_h = self.width(), self.height()
+        expected_w, expected_h = self.screen_size.width(), self.screen_size.height()
+        
+        print(f"[Calibration] After show - Expected: {expected_w}x{expected_h}, Actual: {actual_w}x{actual_h}")
+        
+        if actual_w != expected_w or actual_h != expected_h:
+            print(f"[Calibration] Size mismatch! Regenerating grid with actual window size")
+            self.screen_size = QtCore.QSize(actual_w, actual_h)
+            self.grid_points = self._generate_grid_points()
+            self.remaining_points = list(self.grid_points)
+        
+        # Now start calibration with correct coordinates
+        self._next_point()
+        tts("Calibrating")
+    
+    def _generate_grid_points(self) -> List[Tuple[int, int]]:
+        """Generate grid of calibration points in LOGICAL coordinates (for Qt drawing)."""
+        rows, cols = settings.CAL_GRID_CONFIGS[self.grid_size]
+        w, h = self.screen_size.width(), self.screen_size.height()
+        
+        points = []
+        for row in range(rows):
+            for col in range(cols):
+                # Place points at edges and evenly spaced
+                # Use width-1 and height-1 since screen coordinates are 0-indexed
+                x = int((col / (cols - 1)) * (w - 1)) if cols > 1 else w // 2
+                y = int((row / (rows - 1)) * (h - 1)) if rows > 1 else h // 2
+                points.append((x, y))
+        
+        print(f"[Calibration] Generated {len(points)} grid points (logical): {points[:3]}...")
+        return points
+    
+    def _logical_to_physical(self, logical_point: Tuple[int, int]) -> Tuple[int, int]:
+        """Convert logical Qt coordinates to physical screen/mouse coordinates."""
+        x, y = logical_point
+        physical_x = int(x * self.device_pixel_ratio)
+        physical_y = int(y * self.device_pixel_ratio)
+        return (physical_x, physical_y)
+    
+    def _create_controls(self):
+        """Create control buttons."""
+        # Button panel at bottom center
+        self.button_widget = QtWidgets.QWidget(self)
+        button_layout = QtWidgets.QHBoxLayout(self.button_widget)
+        
+        # Apply calibration button scaling
+        btn_font_size = settings.scaled_font_size(12, settings.DEF_UI_SCALE_CAL_BUTTONS)
+        btn_font = QtGui.QFont()
+        btn_font.setPointSize(btn_font_size)
+        btn_font.setBold(True)
+        
+        btn_min_w = settings.scaled_size(150, settings.DEF_UI_SCALE_CAL_BUTTONS)
+        btn_min_h = settings.scaled_size(50, settings.DEF_UI_SCALE_CAL_BUTTONS)
+        
+        self.collect_btn = QtWidgets.QPushButton(f"(C)ollect {self.cal_auto_collect_s:.0f}s")
+        self.collect_btn.setFont(btn_font)
+        self.collect_btn.setMinimumSize(btn_min_w, btn_min_h)
+        self.collect_btn.clicked.connect(self._start_auto_collect)
+        
+        self.opacity_btn = QtWidgets.QPushButton("(O)pacity")
+        self.opacity_btn.setFont(btn_font)
+        self.opacity_btn.setMinimumSize(btn_min_w, btn_min_h)
+        self.opacity_btn.setCheckable(True)
+        self.opacity_btn.setChecked(True)  # Darkening on by default
+        self.opacity_btn.clicked.connect(self.toggle_opacity)
+        
+        self.accept_btn = QtWidgets.QPushButton("Accept Point (A)")
+        self.accept_btn.setFont(btn_font)
+        self.accept_btn.setMinimumSize(btn_min_w, btn_min_h)
+        self.accept_btn.clicked.connect(self.accept_point)
+        
+        self.undo_btn = QtWidgets.QPushButton("Undo Last (U)")
+        self.undo_btn.setFont(btn_font)
+        self.undo_btn.setMinimumSize(btn_min_w, btn_min_h)
+        self.undo_btn.clicked.connect(self.undo_point)
+        
+        self.cancel_btn = QtWidgets.QPushButton("Cancel (Esc)")
+        self.cancel_btn.setFont(btn_font)
+        self.cancel_btn.setMinimumSize(btn_min_w, btn_min_h)
+        self.cancel_btn.clicked.connect(self.cancel_calibration)
+        
+        button_layout.addWidget(self.collect_btn)
+        button_layout.addWidget(self.opacity_btn)
+        button_layout.addWidget(self.accept_btn)
+        button_layout.addWidget(self.undo_btn)
+        button_layout.addWidget(self.cancel_btn)
+        
+        # Position at bottom center
+        self.button_widget.adjustSize()
+        self.button_widget.move(
+            (self.screen_size.width() - self.button_widget.width()) // 2,
+            self.screen_size.height() - self.button_widget.height() - 20
+        )
+    
+    def _next_point(self):
+        """Select and display next calibration point (sequential for MVP)."""
+        # Announce previous point's sample count if any
+        if self.current_point is not None:
+            physical_point = self._logical_to_physical(self.current_point)
+            count = self.cal_data.get_sample_count(physical_point)
+            if count > 0:
+                tts(f"{count}")  # Just say the number
+        
+        if not self.remaining_points:
+            # Calibration complete
+            self._complete_calibration()
+            return
+        
+        # Sequential order for simplicity (start corner, work through grid)
+        self.current_point = self.remaining_points.pop(0)
+        
+        self.update()
+        
+        # TTS direction hint - just say the direction
+        direction = self._get_direction_text(self.current_point)
+        tts(direction)  # Just "top left", not "Look at the top left"
+        print(f"[Calibration] Next point: {self.current_point} ({direction})")
+    
+    def _get_direction_text(self, point: Tuple[int, int]) -> str:
+        """Get human-readable direction for a point."""
+        x, y = point
+        w, h = self.screen_size.width(), self.screen_size.height()
+        
+        vert = "top" if y < h / 3 else ("bottom" if y > 2 * h / 3 else "middle")
+        horiz = "left" if x < w / 3 else ("right" if x > 2 * w / 3 else "center")
+        
+        if vert == "middle" and horiz == "center":
+            return "center"
+        elif vert == "middle":
+            return horiz
+        elif horiz == "center":
+            return vert
+        else:
+            return f"{vert} {horiz}"
+    
+    @QtCore.Slot(np.ndarray, dict)
+    def update_frame_and_data(self, frame: np.ndarray, gaze_data: dict):
+        """Update video frame and current gaze data."""
+        self.current_frame = frame
+        self.current_gaze_data = gaze_data
+        
+        # Handle auto-collection
+        if self.auto_collecting and gaze_data:
+            elapsed = datetime.now().timestamp() - self.auto_collect_start
+            if elapsed < self.cal_auto_collect_s:
+                # Still collecting
+                self.auto_collect_samples.append(gaze_data)
+            else:
+                # Done collecting
+                self._finish_auto_collect()
+        
+        # Compute cursor screen position from gaze data
+        if gaze_data and gaze_data.get('avg_gaze') is not None:
+            avg_gaze = gaze_data['avg_gaze']
+            w, h = self.screen_size.width(), self.screen_size.height()
+            
+            if self.active_preset:
+                cx, cy = self._map_gaze_with_preset(gaze_data, w, h)
+            else:
+                cx = w // 2 - int(avg_gaze[0] * w * 0.5)
+                cy = h // 2 + int(avg_gaze[1] * h * 0.5)
+            
+            cx = max(0, min(w - 1, cx))
+            cy = max(0, min(h - 1, cy))
+            self.cursor_screen_pos = (cx, cy)
+        else:
+            self.cursor_screen_pos = None
+        
+        self.update()
+    
+    def _map_gaze_with_preset(self, gaze_data: dict, screen_w: int, screen_h: int) -> Tuple[int, int]:
+        """Map gaze data to screen coordinates using calibration preset."""
+        avg_gaze = gaze_data.get('avg_gaze')
+        if avg_gaze is None:
+            return screen_w // 2, screen_h // 2
+        
+        cal_points = self.active_preset.get_averaged_data()
+        
+        if not cal_points:
+            return screen_w // 2 - int(avg_gaze[0] * screen_w * 0.5), \
+                   screen_h // 2 + int(avg_gaze[1] * screen_h * 0.5)
+        
+        gaze_x, gaze_y = avg_gaze[0], avg_gaze[1]
+        
+        # Inverse distance weighting
+        total_weight = 0.0
+        weighted_x = 0.0
+        weighted_y = 0.0
+        
+        for (screen_x, screen_y), data in cal_points.items():
+            if data.get('avg_gaze') is None:
+                continue
+            
+            cal_gaze = data['avg_gaze']
+            dist = np.sqrt((gaze_x - cal_gaze[0])**2 + (gaze_y - cal_gaze[1])**2)
+            
+            if dist < 0.001:
+                return screen_x, screen_y
+            
+            weight = 1.0 / (dist ** 2)
+            total_weight += weight
+            weighted_x += screen_x * weight
+            weighted_y += screen_y * weight
+        
+        if total_weight > 0:
+            return int(weighted_x / total_weight), int(weighted_y / total_weight)
+        else:
+            return screen_w // 2, screen_h // 2
     
     def _start_auto_collect(self):
         """Start auto-collection mode."""
@@ -514,14 +813,17 @@ class CalibrationData:
             self.cal_data.display_description = dialog.display_edit.text()
             self.cal_data.is_favorite = dialog.favorite_cb.isChecked()
             
+            # Store set_as_default flag for MainWindow to handle
+            self.cal_data._set_as_default = dialog.default_cb.isChecked()
+            
             # Check if overwriting existing
             save_file = dialog.get_save_file()
             if save_file:
-                if dialog.selected_existing:
-                    self.cal_data.sort_order = dialog.selected_existing.sort_order
                 self.cal_data.save(save_file)
+                self.cal_data._filename = save_file.name
             else:
-                self.cal_data.save()
+                saved_path = self.cal_data.save()
+                self.cal_data._filename = saved_path.name
         
         self.calibrationComplete.emit(self.cal_data)
         self.close()
@@ -683,7 +985,7 @@ class PresetSaveDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle("Save Calibration Preset")
         self.setMinimumWidth(500)
-        self.setMinimumHeight(400)
+        self.setMinimumHeight(450)
         
         self.selected_existing = None
         self.existing_presets = []
@@ -736,6 +1038,10 @@ class PresetSaveDialog(QtWidgets.QDialog):
         self.favorite_cb = QtWidgets.QCheckBox("Add to favorites (show in main toolbar)")
         form.addRow(self.favorite_cb)
         
+        self.default_cb = QtWidgets.QCheckBox("Set as default preset (load on startup)")
+        self.default_cb.setChecked(True)  # Default checked
+        form.addRow(self.default_cb)
+        
         layout.addWidget(form_group)
         
         buttons = QtWidgets.QDialogButtonBox(
@@ -761,7 +1067,7 @@ class PresetSaveDialog(QtWidgets.QDialog):
                 except Exception as e:
                     print(f"[Calibration] Error loading {f}: {e}")
         
-        self.existing_presets.sort(key=lambda p: (p.sort_order, p.name))
+        self.existing_presets.sort(key=lambda p: p.name)
         self.existing_table.setRowCount(len(self.existing_presets))
         
         for row, preset in enumerate(self.existing_presets):
@@ -801,14 +1107,22 @@ class PresetsManagerDialog(QtWidgets.QDialog):
     """Dialog for managing calibration presets."""
     
     presetSelected = QtCore.Signal(CalibrationData)
+    presetsOrderChanged = QtCore.Signal(list)  # Emits new presets_order
+    presetsRankChanged = QtCore.Signal(list)   # Emits new presets_rank
     
-    def __init__(self, parent=None):
+    def __init__(self, presets_order: List[str], presets_rank: List[str], 
+                 active_preset: CalibrationData = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Presets Manager")
-        self.setMinimumSize(750, 500)
+        self.setMinimumSize(850, 550)
         
         self.selected_preset = None
         self.preset_files = {}
+        self.presets_order = list(presets_order)  # Copy to modify
+        self.presets_rank = list(presets_rank)
+        self.active_preset = active_preset  # For "Save Current Calib."
+        self.default_radio_group = QtWidgets.QButtonGroup(self)
+        self.default_radio_group.setExclusive(False)  # We'll manage exclusivity manually
         
         layout = QtWidgets.QVBoxLayout(self)
         
@@ -844,8 +1158,8 @@ class PresetsManagerDialog(QtWidgets.QDialog):
         layout.addWidget(details_group)
         
         self.table = QtWidgets.QTableWidget()
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["★", "Short UI Name", "Camera Descr.", "Display Descr.", "Calibrated"])
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Default", "★", "Short UI Name", "Camera Descr.", "Display Descr.", "Calibrated"])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
@@ -870,6 +1184,10 @@ class PresetsManagerDialog(QtWidgets.QDialog):
         self.move_down_btn.clicked.connect(self._on_move_down)
         btn_layout.addWidget(self.move_down_btn)
         
+        self.save_current_btn = QtWidgets.QPushButton("Save Current Calib.")
+        self.save_current_btn.clicked.connect(self._on_save_current)
+        btn_layout.addWidget(self.save_current_btn)
+        
         btn_layout.addStretch()
         
         self.close_btn = QtWidgets.QPushButton("Close")
@@ -889,15 +1207,56 @@ class PresetsManagerDialog(QtWidgets.QDialog):
             for f in settings.CAL_PRESETS_DIR.glob('*.yaml'):
                 try:
                     preset = CalibrationData.load(f)
+                    preset._filename = f.name
                     self.presets.append(preset)
-                    self.preset_files[id(preset)] = f
+                    self.preset_files[f.name] = f
                 except Exception as e:
                     print(f"[Calibration] Error loading {f}: {e}")
         
-        self.presets.sort(key=lambda p: (p.sort_order, p.name))
+        # Clean presets_order and presets_rank of missing files
+        existing_files = set(self.preset_files.keys())
+        self.presets_order = [f for f in self.presets_order if f in existing_files]
+        self.presets_rank = [f for f in self.presets_rank if f in existing_files]
+        
+        # Sort by presets_order, then alphabetically
+        preset_by_filename = {p._filename: p for p in self.presets}
+        ordered = []
+        seen = set()
+        for filename in self.presets_order:
+            if filename in preset_by_filename:
+                ordered.append(preset_by_filename[filename])
+                seen.add(filename)
+        remaining = [p for p in self.presets if p._filename not in seen]
+        remaining.sort(key=lambda p: p.name)
+        self.presets = ordered + remaining
+        
+        # Update presets_order to match current full order
+        self.presets_order = [p._filename for p in self.presets]
+        
+        # Determine current default
+        current_default_filename = self.presets_rank[0] if self.presets_rank else None
+        
         self.table.setRowCount(len(self.presets))
         
+        # Clear old radio buttons from group
+        for btn in self.default_radio_group.buttons():
+            self.default_radio_group.removeButton(btn)
+        
         for row, preset in enumerate(self.presets):
+            # Default radio button
+            default_widget = QtWidgets.QWidget()
+            default_layout = QtWidgets.QHBoxLayout(default_widget)
+            default_layout.setContentsMargins(2, 2, 2, 2)
+            default_layout.setAlignment(QtCore.Qt.AlignCenter)
+            
+            default_rb = QtWidgets.QRadioButton()
+            default_rb.setChecked(preset._filename == current_default_filename)
+            default_rb.toggled.connect(lambda checked, fn=preset._filename: self._on_default_toggled(fn, checked))
+            self.default_radio_group.addButton(default_rb, row)
+            default_layout.addWidget(default_rb)
+            self.table.setCellWidget(row, 0, default_widget)
+            
+            # Favorite checkbox
             fav_widget = QtWidgets.QWidget()
             fav_layout = QtWidgets.QHBoxLayout(fav_widget)
             fav_layout.setContentsMargins(2, 2, 2, 2)
@@ -907,22 +1266,87 @@ class PresetsManagerDialog(QtWidgets.QDialog):
             fav_cb.setChecked(preset.is_favorite)
             fav_cb.stateChanged.connect(lambda state, r=row: self._toggle_favorite(r, state))
             fav_layout.addWidget(fav_cb)
-            self.table.setCellWidget(row, 0, fav_widget)
+            self.table.setCellWidget(row, 1, fav_widget)
             
             name_item = QtWidgets.QTableWidgetItem(preset.name)
-            self.table.setItem(row, 1, name_item)
+            self.table.setItem(row, 2, name_item)
             
             cam_item = QtWidgets.QTableWidgetItem(preset.camera_description)
-            self.table.setItem(row, 2, cam_item)
+            self.table.setItem(row, 3, cam_item)
             
             disp_item = QtWidgets.QTableWidgetItem(preset.display_description)
-            self.table.setItem(row, 3, disp_item)
+            self.table.setItem(row, 4, disp_item)
             
             time_str = preset.timestamp.strftime("%Y-%m-%d %H:%M")
             time_item = QtWidgets.QTableWidgetItem(time_str)
-            self.table.setItem(row, 4, time_item)
+            self.table.setItem(row, 5, time_item)
         
         self.table.resizeColumnsToContents()
+        
+        # Update save current button state
+        self._update_save_current_btn()
+    
+    def _on_default_toggled(self, filename: str, checked: bool):
+        """Handle default radio button toggle."""
+        if checked:
+            # Move to front of rank list
+            if filename in self.presets_rank:
+                self.presets_rank.remove(filename)
+            self.presets_rank.insert(0, filename)
+            
+            # Uncheck other radio buttons (manual exclusivity)
+            for btn in self.default_radio_group.buttons():
+                row = self.default_radio_group.id(btn)
+                if row >= 0 and row < len(self.presets):
+                    if self.presets[row]._filename != filename:
+                        btn.blockSignals(True)
+                        btn.setChecked(False)
+                        btn.blockSignals(False)
+    
+    def _update_save_current_btn(self):
+        """Update save current calibration button state."""
+        if self.active_preset is None:
+            self.save_current_btn.setEnabled(False)
+            self.save_current_btn.setToolTip("No current calibration to save")
+            self.save_current_btn.setText("No current calibration")
+        else:
+            self.save_current_btn.setEnabled(True)
+            self.save_current_btn.setToolTip("Save the current session's calibration as a preset")
+            self.save_current_btn.setText("Save Current Calib.")
+    
+    def _on_save_current(self):
+        """Open save dialog for current active calibration."""
+        if self.active_preset is None:
+            return
+        
+        dialog = PresetSaveDialog(self)
+        dialog.name_edit.setText(self.active_preset.name or f"Calibration {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        dialog.camera_edit.setText(self.active_preset.camera_description)
+        dialog.display_edit.setText(self.active_preset.display_description)
+        dialog.favorite_cb.setChecked(self.active_preset.is_favorite)
+        
+        if dialog.exec() == QtWidgets.QDialog.Accepted:
+            self.active_preset.name = dialog.name_edit.text() or f"Calibration {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            self.active_preset.camera_description = dialog.camera_edit.text()
+            self.active_preset.display_description = dialog.display_edit.text()
+            self.active_preset.is_favorite = dialog.favorite_cb.isChecked()
+            
+            save_file = dialog.get_save_file()
+            if save_file:
+                self.active_preset.save(save_file)
+                filename = save_file.name
+            else:
+                saved_path = self.active_preset.save()
+                filename = saved_path.name
+            
+            # Handle set as default
+            if dialog.default_cb.isChecked():
+                if filename in self.presets_rank:
+                    self.presets_rank.remove(filename)
+                self.presets_rank.insert(0, filename)
+            
+            # Reload table
+            self._load_presets()
     
     def _get_selected_row(self) -> int:
         """Get selected row, or show message if none selected."""
@@ -933,34 +1357,26 @@ class PresetsManagerDialog(QtWidgets.QDialog):
         return row
     
     def _on_move_up(self):
-        """Move selected preset up."""
+        """Move selected preset up in display order."""
         row = self._get_selected_row()
         if row < 0 or row == 0:
             return
-        self._swap_sort_order(row, row - 1)
+        # Swap in presets_order
+        self.presets_order[row], self.presets_order[row - 1] = \
+            self.presets_order[row - 1], self.presets_order[row]
+        self._load_presets()
         self.table.selectRow(row - 1)
     
     def _on_move_down(self):
-        """Move selected preset down."""
+        """Move selected preset down in display order."""
         row = self._get_selected_row()
         if row < 0 or row >= len(self.presets) - 1:
             return
-        self._swap_sort_order(row, row + 1)
-        self.table.selectRow(row + 1)
-    
-    def _swap_sort_order(self, row1: int, row2: int):
-        """Swap sort order of two presets and save."""
-        p1, p2 = self.presets[row1], self.presets[row2]
-        p1.sort_order, p2.sort_order = p2.sort_order, p1.sort_order
-        
-        f1 = self.preset_files.get(id(p1))
-        f2 = self.preset_files.get(id(p2))
-        if f1:
-            p1.save(f1)
-        if f2:
-            p2.save(f2)
-        
+        # Swap in presets_order
+        self.presets_order[row], self.presets_order[row + 1] = \
+            self.presets_order[row + 1], self.presets_order[row]
         self._load_presets()
+        self.table.selectRow(row + 1)
     
     def _toggle_favorite(self, row: int, state: int):
         """Toggle favorite status."""
@@ -969,7 +1385,7 @@ class PresetsManagerDialog(QtWidgets.QDialog):
         preset = self.presets[row]
         preset.is_favorite = (state == QtCore.Qt.Checked)
         
-        f = self.preset_files.get(id(preset))
+        f = self.preset_files.get(preset._filename)
         if f:
             preset.save(f)
     
@@ -1000,8 +1416,27 @@ class PresetsManagerDialog(QtWidgets.QDialog):
         )
         
         if reply == QtWidgets.QMessageBox.Yes:
-            f = self.preset_files.get(id(preset))
+            f = self.preset_files.get(preset._filename)
             if f and f.exists():
                 print(f"[Calibration] Deleting {f}")
                 f.unlink()
+            
+            # Remove from order/rank lists
+            if preset._filename in self.presets_order:
+                self.presets_order.remove(preset._filename)
+            if preset._filename in self.presets_rank:
+                self.presets_rank.remove(preset._filename)
+            
             self._load_presets()
+    
+    def closeEvent(self, event):
+        """Emit changed signals on close."""
+        self.presetsOrderChanged.emit(self.presets_order)
+        self.presetsRankChanged.emit(self.presets_rank)
+        super().closeEvent(event)
+    
+    def reject(self):
+        """Override reject to also emit signals."""
+        self.presetsOrderChanged.emit(self.presets_order)
+        self.presetsRankChanged.emit(self.presets_rank)
+        super().reject()
