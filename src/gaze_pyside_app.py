@@ -130,10 +130,12 @@ def termplot(level: int, line: str):
     """Print plot data if verbosity level is high enough.
     
     Usage:
-        termplot(1, "PLOT:EYE_L.x:{:.4f} EYE_L.y:{:.4f}".format(x, y))
+        termplot(1, "PLOT:EYES.x:{:.4f} EYES.y:{:.4f} GAZE.x:{:.4f} GAZE.y:{:.4f}".format(...))
     
     Output can be filtered with:
-        ./gaze.py -P 1 | grep ^PLOT: | sed 's/^PLOT://' | splotty -
+        ./gaze.py -P 1 | grep ^PLOT: | sed 's/^PLOT://' | splotty --stdin
+    
+    Fields: EYES.x/y (eye-only), FACE.x/y (face aim), GAZE.x/y (combined)
     """
     if _print_data_level >= level:
         print(line)
@@ -985,10 +987,14 @@ class VideoWorker(QtCore.QObject):
         # else: no eyes open - avg_dir stays None, no update
         
         if avg_dir is not None:
+            # Save eye-only gaze before combining with face
+            eye_only_dir = avg_dir.copy()
+            
             # Add face aim to averaged gaze to get world-space direction
             # Rationale: If eyes look at world angle +20, head turns +5 toward target,
             # eye-relative gaze shifts to +15. World gaze = eye-relative + head = 15 + 5 = 20
-            avg_dir = avg_dir + face_dir_prelim
+            combined_gaze = avg_dir + face_dir_prelim
+            avg_dir = combined_gaze  # Keep using avg_dir for rest of code
             
             avg_center = np.mean(np.array(centers_px, dtype=np.float32), axis=0)
             acx, acy = int(avg_center[0]), int(avg_center[1])
@@ -1010,9 +1016,14 @@ class VideoWorker(QtCore.QObject):
             )
             
             # Output plot data at level 1
+            # EYES = eye gaze only, FACE = face aim only, GAZE = combined (eye + face)
             if _print_data_level >= 1:
-                parts = [f"PLOT:EYES.x:{avg_dir[0]:.4f} EYES.y:{avg_dir[1]:.4f}",
-                        f"FACE.x:{face_dir_prelim[0]:.4f} FACE.y:{face_dir_prelim[1]:.4f}",
+                parts = [f"PLOT:EYES.x:{eye_only_dir[0]:.4f}",
+                        f"EYES.y:{eye_only_dir[1]:.4f}",
+                        f"FACE.x:{face_dir_prelim[0]:.4f}",
+                        f"FACE.y:{face_dir_prelim[1]:.4f}",
+                        f"GAZE.x:{combined_gaze[0]:.4f}",
+                        f"GAZE.y:{combined_gaze[1]:.4f}",
                         f"N_EYES:{len(open_dirs)}"]
                 
                 # Add corner calibration values as constant reference lines
@@ -1022,7 +1033,8 @@ class VideoWorker(QtCore.QObject):
                             corner = self._cal_corners.get(name)
                             if corner and corner.get('gaze'):
                                 gx, gy = corner['gaze']
-                                parts.append(f"C_{name}.x:{gx:.4f} C_{name}.y:{gy:.4f}")
+                                parts.append(f"C_{name}.x:{gx:.4f}")
+                                parts.append(f"C_{name}.y:{gy:.4f}")
                 
                 termplot(1, ' '.join(parts))
             
@@ -1392,12 +1404,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, video_file=None, usb_device=None, dev_device=None,
                  frame_delay=DEF_VFILE_FRAME_DELAY,
                  vfile_fps=DEF_VFILE_FPS, loop=DEF_VFILE_LOOP,
-                 mouse_control=False, cal_auto_collect_s=3.0):
+                 mouse_control=False, cal_auto_collect_s=3.0,
+                 audio_enabled=None, use_tts=None):
         super().__init__()
         self.setWindowTitle("Eye Gaze Tracker - Accessibility HID Controller")
         
         # Mouse control state
         self.mouse_control_enabled = mouse_control
+        
+        # Audio settings (None = use saved/default, True/False = forced)
+        self._cli_audio_enabled = audio_enabled
+        self._cli_use_tts = use_tts
+        # These will be set properly in load_settings()
+        self.audio_enabled = app_settings.DEF_AUDIO_ENABLED
+        self.use_tts = app_settings.DEF_USE_TTS
         
         # Calibration auto-collect duration
         self.cal_auto_collect_s = cal_auto_collect_s
@@ -1847,6 +1867,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'right_eye_enabled': self.right_eye_cb.isChecked(),
             'presets_order': self.presets_order,
             'presets_rank': self.presets_rank,
+            'audio_enabled': self.audio_enabled,
+            'use_tts': self.use_tts,
         }
         
         # Add filter settings if dialog exists
@@ -1871,6 +1893,7 @@ class MainWindow(QtWidgets.QMainWindow):
         config_dir = app_settings.CAL_PRESETS_DIR.parent
         settings_file = config_dir / 'settings.yaml'
         if not settings_file.exists():
+            self._apply_audio_cli_overrides()
             self._update_notice()
             return
         
@@ -1879,6 +1902,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 config = yaml.safe_load(f)
             
             if not config:
+                self._apply_audio_cli_overrides()
                 self._update_notice()
                 return
             
@@ -1930,6 +1954,14 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.saved_filter_settings = None
             
+            # Load audio settings (then apply CLI overrides if provided)
+            if 'audio_enabled' in config:
+                self.audio_enabled = config['audio_enabled']
+            if 'use_tts' in config:
+                self.use_tts = config['use_tts']
+            
+            self._apply_audio_cli_overrides()
+            
             print(f"[UI] Loaded settings from {settings_file}")
             self.status.showMessage("Settings loaded", 2000)
             
@@ -1960,7 +1992,9 @@ class MainWindow(QtWidgets.QMainWindow):
             screen_size=screen_size,
             grid_size=app_settings.DEF_CAL_GRID_SIZE,
             active_preset=self.active_preset,
-            cal_auto_collect_s=self.cal_auto_collect_s
+            cal_auto_collect_s=self.cal_auto_collect_s,
+            audio_enabled=self.audio_enabled,
+            use_tts=self.use_tts,
         )
         
         # Connect worker gaze data to calibration window (DirectConnection for responsiveness)
@@ -1970,6 +2004,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Connect calibration completion/cancellation
         self.calibration_window.calibrationComplete.connect(self.on_calibration_complete)
         self.calibration_window.calibrationCancelled.connect(self.on_calibration_cancelled)
+        
+        # Connect audio settings changes (to persist user's preference)
+        self.calibration_window.audioSettingsChanged.connect(self._on_audio_settings_changed)
         
         # Show calibration window
         self.calibration_window.showFullScreen()
@@ -2013,6 +2050,24 @@ class MainWindow(QtWidgets.QMainWindow):
         """Handle calibration cancellation."""
         self.status.showMessage("Calibration cancelled", 2000)
         self.calibration_window = None
+
+    def _on_audio_settings_changed(self, audio_enabled: bool, use_tts: bool):
+        """Handle audio settings change from calibration window."""
+        self.audio_enabled = audio_enabled
+        self.use_tts = use_tts
+        print(f"[UI] Audio settings changed: enabled={audio_enabled}, use_tts={use_tts}")
+    
+    def _apply_audio_cli_overrides(self):
+        """Apply CLI audio overrides and update global state."""
+        # CLI overrides take precedence over loaded/default values
+        if self._cli_audio_enabled is not None:
+            self.audio_enabled = self._cli_audio_enabled
+        if self._cli_use_tts is not None:
+            self.use_tts = self._cli_use_tts
+        
+        # Update calibration module's global state
+        calibration.set_audio_state(self.audio_enabled, self.use_tts)
+        print(f"[UI] Audio: enabled={self.audio_enabled}, use_tts={self.use_tts}")
 
     def open_presets_manager(self):
         """Open the presets manager dialog."""
@@ -2218,6 +2273,10 @@ Video File Controls:
   M         Toggle mouse control
   Q         Quit application
   
+Calibration Window Controls:
+  D         Toggle audio on/off
+  T         Toggle TTS/tones mode
+  
 Camera Sources:
   Default: TCP stream from camsettingsh264.py (camhost:camport)
   --usb: USB camera by identifier (from v4l2-ctl --list-devices)
@@ -2237,6 +2296,19 @@ Camera Sources:
                        help="Duration for 'C' key auto-collection in calibration (default: 3.0)")
     parser.add_argument("-P", "--print-data", type=int, default=0, metavar="LEVEL",
                        help="Verbosity level for plot data output (0=off, 1+=on)")
+    
+    # Audio control arguments
+    audio_group = parser.add_mutually_exclusive_group()
+    audio_group.add_argument("--no-audio", "-A", action="store_true",
+                            help="Disable all audio at startup")
+    audio_group.add_argument("--audio", action="store_true",
+                            help="Force audio on (override saved settings)")
+    
+    tts_group = parser.add_mutually_exclusive_group()
+    tts_group.add_argument("--no-tts", "-T", action="store_true",
+                          help="Use tones instead of TTS")
+    tts_group.add_argument("--tts", action="store_true",
+                          help="Force TTS on (override saved settings)")
     
     args = parser.parse_args()
     
@@ -2263,7 +2335,10 @@ Camera Sources:
         vfile_fps=args.vfile_fps,
         loop=(not args.no_loop),
         mouse_control=args.mouse,
-        cal_auto_collect_s=args.cal_auto_s
+        cal_auto_collect_s=args.cal_auto_s,
+        # Audio settings: None means "use saved/default", True/False forces that value
+        audio_enabled=False if args.no_audio else (True if args.audio else None),
+        use_tts=False if args.no_tts else (True if args.tts else None),
     )
     win.resize(1400, 900)
     win.show()

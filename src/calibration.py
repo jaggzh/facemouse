@@ -18,17 +18,75 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 import settings
 
+# ============================================================================
+# Audio System (TTS + Tones)
+# ============================================================================
 
 # TTS queue and lock for sequential playback
 _tts_lock = threading.Lock()
 _tts_process = None
 
+# Audio state (can be modified by CalibrationWindow)
+_audio_enabled = settings.DEF_AUDIO_ENABLED
+_use_tts = settings.DEF_USE_TTS
 
-def tts(msg: str):
-    """Text-to-speech output. Waits for previous speech to complete."""
-    if settings.DEF_CAL_NO_TTS:
+# Try to import sounddevice for tones
+try:
+    import sounddevice as sd
+    _sounddevice_available = True
+except ImportError:
+    _sounddevice_available = False
+    print("[Audio] sounddevice not available - tones disabled")
+
+
+def set_audio_state(audio_enabled: bool, use_tts: bool):
+    """Set global audio state."""
+    global _audio_enabled, _use_tts
+    _audio_enabled = audio_enabled
+    _use_tts = use_tts
+
+
+def get_audio_state() -> Tuple[bool, bool]:
+    """Get current audio state: (audio_enabled, use_tts)."""
+    return _audio_enabled, _use_tts
+
+
+def _play_tone(freq: float, duration: float, volume: float = None):
+    """Play a tone using sounddevice (non-blocking)."""
+    if not _sounddevice_available:
         return
     
+    if volume is None:
+        volume = settings.TONE_DEFAULT_VOLUME
+    
+    def _generate_and_play():
+        try:
+            sample_rate = 44100
+            t = np.linspace(0, duration, int(sample_rate * duration), False)
+            # Generate sine wave
+            wave = np.sin(2 * np.pi * freq * t)
+            # Apply volume (clamp to prevent distortion)
+            wave = wave * min(volume, 2.0) * 0.5
+            # Fade in/out to prevent clicks (10ms fade)
+            fade_samples = int(0.01 * sample_rate)
+            if fade_samples > 0 and len(wave) > fade_samples * 2:
+                fade_in = np.linspace(0, 1, fade_samples)
+                fade_out = np.linspace(1, 0, fade_samples)
+                wave[:fade_samples] *= fade_in
+                wave[-fade_samples:] *= fade_out
+            # Play
+            sd.play(wave.astype(np.float32), sample_rate)
+            sd.wait()
+        except Exception as e:
+            print(f"[Audio] Tone playback failed: {e}")
+    
+    # Run in background thread
+    thread = threading.Thread(target=_generate_and_play, daemon=True)
+    thread.start()
+
+
+def _speak_tts(msg: str):
+    """Text-to-speech output using external script."""
     def _speak():
         global _tts_process
         with _tts_lock:
@@ -46,7 +104,7 @@ def tts(msg: str):
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL
                 )
-                _tts_process.wait()  # Wait for this speech to complete
+                _tts_process.wait()
             except Exception as e:
                 print(f"[TTS] Failed: {e}")
     
@@ -54,6 +112,46 @@ def tts(msg: str):
     thread = threading.Thread(target=_speak, daemon=True)
     thread.start()
 
+
+def play_audio(event: str, direction: str = None):
+    """
+    Play audio for a calibration event.
+    
+    Args:
+        event: One of 'cal_start', 'point_dir', 'point_accepted', 'point_undo', 'cal_complete'
+        direction: For 'point_dir' event, the direction text to speak
+    """
+    if not _audio_enabled:
+        return
+    
+    if _use_tts:
+        # Use TTS
+        msg = settings.CAL_TTS_MESSAGES.get(event, '')
+        if event == 'point_dir' and direction:
+            msg = msg.format(direction=direction)
+        if msg:
+            _speak_tts(msg)
+    else:
+        # Use tones (only for events that have tones)
+        tone_data = settings.TONE_FREQS.get(event)
+        if tone_data:
+            freq, duration = tone_data
+            _play_tone(freq, duration)
+        # point_dir and point_undo have no tones - they're silent in tone mode
+
+
+# Legacy wrapper for compatibility
+def tts(msg: str):
+    """Legacy TTS function - now routes through play_audio for simple messages."""
+    if not _audio_enabled:
+        return
+    if _use_tts:
+        _speak_tts(msg)
+
+
+# ============================================================================
+# Calibration Utilities
+# ============================================================================
 
 def distant_with_noise(
     current_point: Tuple[int, int],
@@ -474,16 +572,25 @@ class CalibrationWindow(QtWidgets.QWidget):
     calibrationComplete = QtCore.Signal(CalibrationData)
     calibrationCancelled = QtCore.Signal()
     progressToNext = QtCore.Signal()  # Signal to move to next point (from worker thread)
+    audioSettingsChanged = QtCore.Signal(bool, bool)  # (audio_enabled, use_tts)
     
     def __init__(self, screen_size: QtCore.QSize, grid_size: int = settings.DEF_CAL_GRID_SIZE, 
                  active_preset: CalibrationData = None, cal_auto_collect_s: float = 3.0, 
-                 device_pixel_ratio: float = 1.0, parent=None):
+                 device_pixel_ratio: float = 1.0,
+                 audio_enabled: bool = None, use_tts: bool = None,
+                 parent=None):
         super().__init__(parent)
         self.screen_size = screen_size  # Logical size for Qt drawing
         self.device_pixel_ratio = device_pixel_ratio  # For converting to physical coordinates
         self.grid_size = grid_size
         self.active_preset = active_preset  # For cursor visualization
         self.cal_auto_collect_s = cal_auto_collect_s
+        
+        # Audio state - use passed values or fall back to global defaults
+        self.audio_enabled = audio_enabled if audio_enabled is not None else _audio_enabled
+        self.use_tts = use_tts if use_tts is not None else _use_tts
+        # Update global state
+        set_audio_state(self.audio_enabled, self.use_tts)
         
         # Calibration state
         self.cal_data = CalibrationData(grid_size=grid_size)
@@ -537,7 +644,7 @@ class CalibrationWindow(QtWidgets.QWidget):
         
         # Now start calibration with correct coordinates
         self._next_point()
-        tts("Calibrating")
+        play_audio('cal_start')
     
     def _generate_grid_points(self) -> List[Tuple[int, int]]:
         """Generate grid of calibration points in LOGICAL coordinates (for Qt drawing)."""
@@ -605,11 +712,25 @@ class CalibrationWindow(QtWidgets.QWidget):
         self.cancel_btn.setMinimumSize(btn_min_w, btn_min_h)
         self.cancel_btn.clicked.connect(self.cancel_calibration)
         
+        # Audio toggle button
+        self.audio_btn = QtWidgets.QPushButton(self._get_audio_btn_text())
+        self.audio_btn.setFont(btn_font)
+        self.audio_btn.setMinimumSize(btn_min_w, btn_min_h)
+        self.audio_btn.clicked.connect(self.toggle_audio)
+        
+        # TTS/Tones toggle button
+        self.tts_btn = QtWidgets.QPushButton(self._get_tts_btn_text())
+        self.tts_btn.setFont(btn_font)
+        self.tts_btn.setMinimumSize(btn_min_w, btn_min_h)
+        self.tts_btn.clicked.connect(self.toggle_tts_mode)
+        
         button_layout.addWidget(self.collect_btn)
         button_layout.addWidget(self.opacity_btn)
         button_layout.addWidget(self.accept_btn)
         button_layout.addWidget(self.undo_btn)
         button_layout.addWidget(self.cancel_btn)
+        button_layout.addWidget(self.audio_btn)
+        button_layout.addWidget(self.tts_btn)
         
         # Position at bottom center
         self.button_widget.adjustSize()
@@ -617,6 +738,43 @@ class CalibrationWindow(QtWidgets.QWidget):
             (self.screen_size.width() - self.button_widget.width()) // 2,
             self.screen_size.height() - self.button_widget.height() - 20
         )
+    
+    def _get_audio_btn_text(self) -> str:
+        """Get audio button text based on state."""
+        if self.audio_enabled:
+            return "Audio is on (d)"
+        else:
+            return "Audio is off (d)"
+    
+    def _get_tts_btn_text(self) -> str:
+        """Get TTS/tones button text based on state."""
+        if self.use_tts:
+            return "TTS / tones (t)"
+        else:
+            return "Tones / tts (t)"
+    
+    def _update_audio_buttons(self):
+        """Update audio button texts after state change."""
+        self.audio_btn.setText(self._get_audio_btn_text())
+        self.tts_btn.setText(self._get_tts_btn_text())
+    
+    @QtCore.Slot()
+    def toggle_audio(self):
+        """Toggle audio on/off."""
+        self.audio_enabled = not self.audio_enabled
+        set_audio_state(self.audio_enabled, self.use_tts)
+        self._update_audio_buttons()
+        self.audioSettingsChanged.emit(self.audio_enabled, self.use_tts)
+        print(f"[Calibration] Audio {'enabled' if self.audio_enabled else 'disabled'}")
+    
+    @QtCore.Slot()
+    def toggle_tts_mode(self):
+        """Toggle between TTS and tones."""
+        self.use_tts = not self.use_tts
+        set_audio_state(self.audio_enabled, self.use_tts)
+        self._update_audio_buttons()
+        self.audioSettingsChanged.emit(self.audio_enabled, self.use_tts)
+        print(f"[Calibration] Using {'TTS' if self.use_tts else 'tones'}")
     
     def _next_point(self):
         """Select and display next calibration point (sequential for MVP)."""
@@ -639,7 +797,7 @@ class CalibrationWindow(QtWidgets.QWidget):
         
         # TTS direction hint - just say the direction
         direction = self._get_direction_text(self.current_point)
-        tts(direction)  # Just "top left", not "Look at the top left"
+        play_audio('point_dir', direction=direction)
         print(f"[Calibration] Next point: {self.current_point} ({direction})")
     
     def _get_direction_text(self, point: Tuple[int, int]) -> str:
@@ -773,7 +931,7 @@ class CalibrationWindow(QtWidgets.QWidget):
         if hasattr(self, 'current_gaze_data') and self.current_gaze_data:
             physical_point = self._logical_to_physical(self.current_point)
             self.cal_data.add_sample(physical_point, self.current_gaze_data)
-            # No TTS - keep it silent and fast
+            play_audio('point_accepted')
             print(f"[Calibration] Accepted point logical {self.current_point} -> physical {physical_point}, samples: {self.cal_data.get_sample_count(physical_point)}")
         
         # Move to next point immediately
@@ -785,7 +943,7 @@ class CalibrationWindow(QtWidgets.QWidget):
         if self.current_point:
             physical_point = self._logical_to_physical(self.current_point)
             if self.cal_data.remove_last_sample(physical_point):
-                # No TTS - keep it silent
+                play_audio('point_undo')
                 self.update()
     
     @QtCore.Slot()
@@ -803,7 +961,7 @@ class CalibrationWindow(QtWidgets.QWidget):
     
     def _complete_calibration(self):
         """Complete calibration and emit data."""
-        tts("Done")  # Short and sweet
+        play_audio('cal_complete')
         
         # Show save dialog with name and descriptions
         dialog = PresetSaveDialog(self)
@@ -974,6 +1132,10 @@ class CalibrationWindow(QtWidgets.QWidget):
         elif key == QtCore.Qt.Key_O:
             self.opacity_btn.toggle()  # Toggle the button state
             self.toggle_opacity()
+        elif key == QtCore.Qt.Key_D:
+            self.toggle_audio()
+        elif key == QtCore.Qt.Key_T:
+            self.toggle_tts_mode()
         else:
             super().keyPressEvent(event)
 
@@ -1199,41 +1361,22 @@ class PresetsManagerDialog(QtWidgets.QDialog):
         self._load_presets()
     
     def _load_presets(self):
-        """Load and display all presets."""
-        self.presets = []
+        """Load presets and populate table."""
+        self.presets = CalibrationData.list_presets(self.presets_order)
         self.preset_files = {}
         
+        # Build filename -> file path mapping
         if settings.CAL_PRESETS_DIR.exists():
             for f in settings.CAL_PRESETS_DIR.glob('*.yaml'):
-                try:
-                    preset = CalibrationData.load(f)
-                    preset._filename = f.name
-                    self.presets.append(preset)
-                    self.preset_files[f.name] = f
-                except Exception as e:
-                    print(f"[Calibration] Error loading {f}: {e}")
+                self.preset_files[f.name] = f
         
-        # Clean presets_order and presets_rank of missing files
-        existing_files = set(self.preset_files.keys())
-        self.presets_order = [f for f in self.presets_order if f in existing_files]
-        self.presets_rank = [f for f in self.presets_rank if f in existing_files]
+        # Ensure presets_order has all presets
+        existing_filenames = {p._filename for p in self.presets if hasattr(p, '_filename')}
+        for filename in existing_filenames:
+            if filename not in self.presets_order:
+                self.presets_order.append(filename)
         
-        # Sort by presets_order, then alphabetically
-        preset_by_filename = {p._filename: p for p in self.presets}
-        ordered = []
-        seen = set()
-        for filename in self.presets_order:
-            if filename in preset_by_filename:
-                ordered.append(preset_by_filename[filename])
-                seen.add(filename)
-        remaining = [p for p in self.presets if p._filename not in seen]
-        remaining.sort(key=lambda p: p.name)
-        self.presets = ordered + remaining
-        
-        # Update presets_order to match current full order
-        self.presets_order = [p._filename for p in self.presets]
-        
-        # Determine current default
+        # Get current default
         current_default_filename = self.presets_rank[0] if self.presets_rank else None
         
         self.table.setRowCount(len(self.presets))

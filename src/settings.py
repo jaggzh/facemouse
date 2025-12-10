@@ -48,6 +48,32 @@ VIZ_CURSOR_CROSSHAIR_COLOR = (0xb0, 0x30, 0x90)  # Same as cursor
 VIZ_CURSOR_LINE_THICKNESS = 1
 
 # ============================================================================
+# Audio / TTS Settings
+# ============================================================================
+DEF_AUDIO_ENABLED = True   # Master audio toggle (False = complete silence)
+DEF_USE_TTS = True         # True = TTS, False = tones
+
+# TTS messages for calibration events
+# Keys: cal_start, point_dir, point_accepted, point_undo, cal_complete
+CAL_TTS_MESSAGES = {
+    'cal_start': 'Starting calibration',
+    'point_dir': '{direction}',
+    'point_accepted': 'Accepted',
+    'point_undo': 'Removed',
+    'cal_complete': 'Complete',
+}
+
+# Tone settings: (frequency_hz, duration_seconds)
+# Volume is controlled separately by TONE_DEFAULT_VOLUME
+TONE_DEFAULT_VOLUME = 1.0  # 0.0 to 2.0 (1.0 = normal)
+TONE_FREQS = {
+    'cal_start': (370, 0.15),
+    'point_accepted': (340, 0.15),
+    'cal_complete': (260, 0.35),
+    # point_dir and point_undo have no tones (TTS only)
+}
+
+# ============================================================================
 # Calibration defaults
 # ============================================================================
 
@@ -80,16 +106,6 @@ CAL_GRID_CONFIGS = {
     30: (6, 5),
 }
 DEF_CAL_GRID_SIZE = 9  # Default grid point count
-
-# TTS
-DEF_CAL_NO_TTS = False  # Enable TTS by default
-CAL_TTS_MESSAGES = {
-    'cal_start': 'Starting calibration',
-    'point_dir': '{direction}',
-    'point_accepted': 'Accepted',
-    'point_undo': 'Removed',
-    'cal_complete': 'Complete',
-}
 
 # Paths
 CAL_PRESETS_DIR = Path.home() / ".config" / "eye_gaze_tracker" / "presets"

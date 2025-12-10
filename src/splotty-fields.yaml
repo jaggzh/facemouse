@@ -1,0 +1,121 @@
+# splotty fieldspec template YAML
+#   Auto-generated
+# groups:
+#   # Name of group (eg. "All")
+#   All:
+#     # key: Optional key (instead of auto)
+#     key: "A"
+#     # state: Starting state of whole group.
+#     state: true
+#     # order: Order in which state applied.
+#     order: 0
+#   Something:
+#     key: "S"
+#     state: false
+#     order: 0
+# state:
+#   # start: true by default (all fields start enabled)
+#   start: true
+# fields:
+#   some_field_name:
+#     # groups: [list of groups this field belongs to]
+#     groups: ["All", "Something"]
+#   another:
+#     groups: ["All"]
+#     # start: starting state of field
+#     # hidden: don't show in ui
+#     # key_auto: defaults to true
+#     start: 0
+#     hidden: true
+#     key_auto: false
+---
+defaults:
+  fields:
+    key_auto: 1
+groups:
+  All:
+    # key: Optional key (instead of auto)
+    key: "a"
+    # state: Starting state of whole group.
+    state: false
+    # order: Order in which state applied.
+    order: 0
+  EyeFace:
+    key: "e"
+    state: false
+    order: 0
+  X:
+    key: "X"
+    state: false
+    order: 1
+  Y:
+    key: "Y"
+    state: true
+    order: 1
+fields:
+  C_bl.x:
+    groups:
+      - All
+      - X
+  C_bl.y:
+    groups:
+      - All
+      - Y
+  C_br.x:
+    groups:
+      - All
+      - X
+  C_br.y:
+    groups:
+      - All
+      - Y
+  C_tl.x:
+    groups:
+      - All
+      - X
+  C_tl.y:
+    groups:
+      - All
+      - Y
+  C_tr.x:
+    groups:
+      - All
+      - X
+  C_tr.y:
+    groups:
+      - All
+      - Y
+  EYES.x:
+    groups:
+      - All
+      - EyeFace
+      - X
+  EYES.y:
+    groups:
+      - All
+      - EyeFace
+      - Y
+  FACE.x:
+    groups:
+      - All
+      - EyeFace
+      - X
+  FACE.y:
+    groups:
+      - All
+      - EyeFace
+      - Y
+  GAZE.x:
+    groups:
+      - All
+      - X
+  GAZE.y:
+    groups:
+      - All
+      - Y
+  N_EYES:
+    groups:
+      - All
+    hidden: true
+state:
+  start: 1
