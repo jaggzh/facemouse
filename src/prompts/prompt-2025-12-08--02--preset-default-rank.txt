@@ -28,14 +28,20 @@ There is only an indicator of the current default (ie. [0] is checked off) (a co
 
 If we can't do radio items in a "Default" column, prior to the favorites column, that's preferable. If not, then we have to do checkmarks right? But we have to prevent multi-select. Whichever item is checked off is placed/moved to the front of the rank list upon closing of the presets window. Thus, the user does not directly manage the rank list -- they can only say "this is my default", and we move it to the front of the rank list. (Without this, we would end up sorting the default (rank) list each time they click; we do not want to do that.)
 
+Disallow unchecking default preset.
+
 Without a default during app load, perhaps we should have an indicator in the UI.
 Let's add a short text area to the right of our top buttons. Perhaps 24em.
 if calib_data is None:
 	if len(calibs): notice_add("No Default Preset", fg="#003050")
 	else: notice_add("Calibration Needed, fg="#003050")
 
+(Don't bother with migration. Ignore sort_order in preset yaml.)
+
 In preset manager, let's add a button to the right of Move Down, "Save Current Calib."
 That will pop up the Save Preset dialog? Is that too much trouble to refactor?
+
+If no calibration is done, deactivate the button and set a tooltip for onhover that says "No Current Calibration to Save". If we can't do tooltips, change the button text to "No current calibration"
 
 Did I handle all the cases/edge cases?
 
