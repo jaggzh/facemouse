@@ -52,8 +52,8 @@ VIZ_CURSOR_LINE_THICKNESS = 1
 # ============================================================================
 
 # Visual settings
-DEF_CAL_VID_DARKEN = 0.75  # Darken video to 25% brightness during calibration
-DEF_CAL_TARGET_SIZE = 40  # Outer circle size in pixels
+DEF_CAL_VID_BRIGHTNESS = 0.55  # Darken video to a fraction (eg. .6 is 60%)
+DEF_CAL_TARGET_SIZE = 60  # Outer circle size in pixels
 DEF_CAL_TARGET_CENTER_SIZE = 8  # Center dot size in pixels
 
 # Colors (B, G, R)

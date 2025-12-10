@@ -839,7 +839,7 @@ class CalibrationWindow(QtWidgets.QWidget):
             
             # Apply darkening if enabled
             if self.darkening_enabled:
-                darkened = (self.current_frame * (1.0 - settings.DEF_CAL_VID_DARKEN)).astype(np.uint8)
+                darkened = (self.current_frame * settings.DEF_CAL_VID_BRIGHTNESS).astype(np.uint8)
             else:
                 darkened = self.current_frame
             
